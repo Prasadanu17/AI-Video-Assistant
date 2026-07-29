@@ -1,0 +1,58 @@
+# ------------------------------
+# UI
+# ------------------------------
+streamlit>=1.36.0
+
+# ------------------------------
+# Audio acquisition & processing
+# ------------------------------
+yt-dlp>=2024.7.1          # Download audio from YouTube URLs
+pydub>=0.25.1              # Audio format conversion / chunking
+ffmpeg-python>=0.2.0       # Wrapper around ffmpeg (ffmpeg binary must be installed separately)
+
+# ------------------------------
+# Transcription (local Whisper)
+# ------------------------------
+openai-whisper>=20231117   # Local Whisper model
+torch>=2.2.0                # Required by Whisper (install CUDA build separately if using GPU)
+
+# ------------------------------
+# Hindi -> English translation
+# ------------------------------
+# Option A: use a local HF translation model (recommended, no extra key needed)
+transformers>=4.42.0
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
+# Option B (alternative, uncomment if you prefer a lightweight wrapper API instead):
+# deep-translator>=1.11.4
+
+# ------------------------------
+# LangChain (LCEL) + Mistral API
+# ------------------------------
+langchain>=0.2.11
+langchain-core>=0.2.24
+langchain-community>=0.2.10
+langchain-mistralai>=0.1.12   # Chat wrapper for Mistral's API
+mistralai>=0.4.2               # Official Mistral SDK (used under the hood / for direct calls)
+
+# ------------------------------
+# RAG: vector store + embeddings
+# ------------------------------
+chromadb>=0.5.4
+langchain-chroma>=0.1.2
+langchain-huggingface>=0.0.3
+sentence-transformers>=3.0.1
+
+# ------------------------------
+# Export (PDF / TXT)
+# ------------------------------
+fpdf2>=2.7.9                # Simple, dependency-light PDF generation
+# reportlab>=4.2.0           # Alternative, more powerful PDF library (uncomment if needed)
+
+# ------------------------------
+# Utilities
+# ------------------------------
+python-dotenv>=1.0.1        # Load MISTRAL_API_KEY etc. from .env
+tqdm>=4.66.4
+numpy>=1.26.4
+requests>=2.32.3

@@ -1,0 +1,26 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment Variables
+.env
+
+# Downloads
+downloads/
+
+# Model files (optional)
+*.pt
+*.bin
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
