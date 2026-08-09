@@ -10,11 +10,26 @@ def download_youtube_audio(url: str) -> str:
     output_path = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     ydl_opts = {
-        "format": "bestaudio",
+        # Best available audio
+        "format": "bestaudio/best",
+
+        # Save inside downloads folder
         "outtmpl": output_path,
 
-        "ffmpeg_location": r"C:\ffmpeg\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin",
+        # Don't download playlists
+        "noplaylist": True,
 
+        # Show progress
+        "quiet": False,
+
+        # Retry on network failures
+        "retries": 10,
+        "fragment_retries": 10,
+
+        # Use Chrome cookies (helps avoid 403 on some videos)
+        "cookiesfrombrowser": ("chrome",),
+
+        # Convert audio to WAV
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -22,9 +37,6 @@ def download_youtube_audio(url: str) -> str:
                 "preferredquality": "192",
             }
         ],
-
-        "noplaylist": True,
-        "quiet": False,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -33,7 +45,15 @@ def download_youtube_audio(url: str) -> str:
         filename = ydl.prepare_filename(info)
         base, _ = os.path.splitext(filename)
 
-        return base + ".wav"
+        wav_path = base + ".wav"
+
+        if not os.path.exists(wav_path):
+            raise FileNotFoundError(f"WAV file not found: {wav_path}")
+
+        print(f"\nDownloaded Successfully!")
+        print(f"Saved to: {wav_path}\n")
+
+        return wav_path
 
 
 def convert_to_wav(input_path: str) -> str:
@@ -91,4 +111,3 @@ def process_input(source: str) -> list:
     print(f"Audio ready - {len(chunks)} chunk(s) created.")
 
     return chunks
- 
