@@ -6,7 +6,7 @@ streamlit>=1.36.0
 # ------------------------------
 # Audio acquisition & processing
 # ------------------------------
-yt-dlp>=2024.7.1          # Download audio from YouTube URLs
+yt-dlp[default]>=2026.8.19  # YouTube downloads with EJS support for JS challenges
 pydub>=0.25.1              # Audio format conversion / chunking
 ffmpeg-python>=0.2.0       # Wrapper around ffmpeg (ffmpeg binary must be installed separately)
 
