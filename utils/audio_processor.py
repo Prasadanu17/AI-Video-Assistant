@@ -21,14 +21,14 @@ def download_youtube_audio(url: str) -> str:
 
     output_path = os.path.join(
         DOWNLOAD_DIR,
-        "%(title)s.%(ext)s"
+        "%(title)s_%(id)s.%(ext)s"
     )
 
     ydl_opts = {
         # Download the best available audio
         "format": "bestaudio/best",
 
-        # Save files in the downloads folder
+        # Save files in the downloads folder with unique ID
         "outtmpl": output_path,
 
         # Do not download playlists
@@ -80,38 +80,56 @@ def download_youtube_audio(url: str) -> str:
             base, _ = os.path.splitext(filename)
             wav_path = base + ".wav"
 
-            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1024:
                 print(f"\n[i] Found existing downloaded WAV: {wav_path}. Skipping download.\n")
                 return wav_path
-        except Exception as e:
+        except Exception:
             # If metadata check fails, proceed to normal download attempt
             pass
 
         # Perform download
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        base, _ = os.path.splitext(filename)
-        wav_path = base + ".wav"
+        try:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(filename)
+            wav_path = base + ".wav"
+        except Exception as e:
+            raise RuntimeError(f"Failed to download audio from YouTube URL '{url}': {e}")
 
-        if not os.path.exists(wav_path):
-            raise FileNotFoundError(f"WAV file not found: {wav_path}")
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+            raise FileNotFoundError(f"WAV file not found or is empty after download: {wav_path}")
 
         print("\nDownload successful!")
         print(f"Saved to: {wav_path}\n")
         return wav_path
 
 
-def convert_to_wav(input_path: str) -> str:
+def convert_to_wav(input_path: str, force_reconvert: bool = False) -> str:
     """
-    Convert a local audio file to 16 kHz mono WAV.
+    Convert a local audio or video file to 16 kHz mono WAV.
     """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    if os.path.getsize(input_path) == 0:
+        raise ValueError(f"Supplied input file is empty (0 bytes): {input_path}")
+
     output_path = os.path.splitext(input_path)[0] + "_converted.wav"
 
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+    if not force_reconvert and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         print(f"[i] Using existing converted audio: {output_path}")
         return output_path
 
-    audio = AudioSegment.from_file(input_path)
+    try:
+        audio = AudioSegment.from_file(input_path)
+    except Exception as e:
+        raise ValueError(
+            f"Unsupported or corrupted media file '{input_path}'. "
+            f"Could not decode audio: {e}"
+        )
+
+    if len(audio) == 0:
+        raise ValueError(f"Extracted audio from '{input_path}' is empty (0ms duration).")
 
     # Convert to mono and 16 kHz
     audio = audio.set_channels(1)
@@ -122,7 +140,7 @@ def convert_to_wav(input_path: str) -> str:
     return output_path
 
 
-def chunk_audio(wav_path: str, chunk_minutes: int = 3) -> list:
+def chunk_audio(wav_path: str, chunk_minutes: int = 3, force_rechunk: bool = False) -> list:
     """
     Split a WAV file into smaller chunks.
     Default chunk duration: 3 minutes.
@@ -130,11 +148,14 @@ def chunk_audio(wav_path: str, chunk_minutes: int = 3) -> list:
     if chunk_minutes <= 0:
         raise ValueError("chunk_minutes must be greater than zero.")
 
+    if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+        raise ValueError(f"WAV audio file is missing or empty: {wav_path}")
+
     base = os.path.splitext(wav_path)[0]
 
-    # Check if chunks already exist
+    # Check if chunks already exist and are valid
     existing_chunk_0 = f"{base}_chunk_0.wav"
-    if os.path.exists(existing_chunk_0) and os.path.getsize(existing_chunk_0) > 0:
+    if not force_rechunk and os.path.exists(existing_chunk_0) and os.path.getsize(existing_chunk_0) > 0:
         existing_chunks = []
         i = 0
         while True:
@@ -148,7 +169,14 @@ def chunk_audio(wav_path: str, chunk_minutes: int = 3) -> list:
             print(f"[i] Found {len(existing_chunks)} existing audio chunk(s). Reusing.")
             return existing_chunks
 
-    audio = AudioSegment.from_wav(wav_path)
+    try:
+        audio = AudioSegment.from_wav(wav_path)
+    except Exception as e:
+        raise ValueError(f"Failed to read WAV file '{wav_path}': {e}")
+
+    if len(audio) == 0:
+        raise ValueError(f"Audio file '{wav_path}' contains no audio data (0ms duration).")
+
     chunk_ms = chunk_minutes * 60 * 1000
     chunks = []
 
@@ -162,10 +190,10 @@ def chunk_audio(wav_path: str, chunk_minutes: int = 3) -> list:
     return chunks
 
 
-def process_input(source: str) -> list:
+def process_input(source: str, force_reprocess: bool = False) -> list:
     """
     Process a YouTube URL or a local audio/video file.
-    Returns a list of WAV audio chunk paths.
+    Returns a list of WAV audio chunk paths in sequential order.
     """
     if source.startswith(("http://", "https://")):
         print("Detected YouTube URL. Downloading...")
@@ -175,9 +203,9 @@ def process_input(source: str) -> list:
             raise FileNotFoundError(f"Input file not found: {source}")
 
         print("Detected local file. Converting to WAV...")
-        wav_path = convert_to_wav(source)
+        wav_path = convert_to_wav(source, force_reconvert=force_reprocess)
 
     print("Chunking audio...")
-    chunks = chunk_audio(wav_path)
+    chunks = chunk_audio(wav_path, force_rechunk=force_reprocess)
     print(f"Audio ready - {len(chunks)} chunk(s) created.")
     return chunks

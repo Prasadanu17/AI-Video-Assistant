@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from utils.audio_processor import process_input
-from core.transcriber import transcribe_all
+from core.transcriber import transcribe_all, resolve_language_mode
 from core.summarizer import summarize, generate_title
 from core.extractor import (
     extract_action_items,
@@ -144,7 +144,16 @@ st.markdown(CSS, unsafe_allow_html=True)
 st.session_state.setdefault("result", None)
 st.session_state.setdefault("messages", [])
 st.session_state.setdefault("source_label", "")
-st.session_state.setdefault("language", "english")
+st.session_state.setdefault("language", "English transcription")
+
+# Supported language options matching requirements
+LANGUAGE_OPTIONS = [
+    "English transcription",
+    "Hinglish transcription using the existing Sarvam integration",
+    "Nepali transcription",
+    "Nepali speech → English text",
+    "Automatic language detection",
+]
 
 # Pause between LLM calls to stay under API rate limits (same as the CLI).
 CALL_DELAY_SECONDS = 1.0
@@ -154,21 +163,39 @@ CALL_DELAY_SECONDS = 1.0
 # Helpers
 # --------------------------------------------------------------------------
 def save_upload(uploaded) -> str:
-    """Write an uploaded file to a temp path so process_input() can read it."""
-    suffix = os.path.splitext(uploaded.name)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded.getbuffer())
-        return tmp.name
+    """Write an uploaded file to a unique temp directory so process_input() can read it without collisions."""
+    tmp_dir = tempfile.mkdtemp(prefix="video_assistant_")
+    clean_name = os.path.basename(uploaded.name)
+    target = os.path.join(tmp_dir, clean_name)
+    with open(target, "wb") as f:
+        f.write(uploaded.getbuffer())
+    return target
 
 
-def run_pipeline_ui(source: str, language: str) -> dict:
+def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False) -> dict:
     """Same steps as the CLI pipeline, with live progress in the UI."""
+    mode_info = resolve_language_mode(language)
+    is_nepali_translate = (mode_info.get("whisper_code") == "ne" and mode_info.get("task") == "translate")
+
     with st.status("Working on your video", expanded=True) as status:
         st.write("Downloading and preparing audio")
         chunks = process_input(source)
 
-        st.write("Transcribing speech")
-        transcript = transcribe_all(chunks, language=language)
+        if is_nepali_translate:
+            st.write("Translating Nepali speech to English")
+            if keep_original_nepali:
+                st.write("Transcribing original Nepali speech (Devanagari)")
+            res = transcribe_all(chunks, language=language, return_original=keep_original_nepali)
+        else:
+            st.write(f"Transcribing speech ({mode_info['display_name']})")
+            res = transcribe_all(chunks, language=language, return_original=False)
+
+        if isinstance(res, dict):
+            transcript = res.get("transcript", "")
+            original_transcript = res.get("original_transcript")
+        else:
+            transcript = str(res)
+            original_transcript = None
 
         st.write("Writing title")
         title = generate_title(transcript)
@@ -197,12 +224,15 @@ def run_pipeline_ui(source: str, language: str) -> dict:
 
     return {
         "transcript": transcript,
+        "original_transcript": original_transcript,
         "title": title,
         "summary": summary,
         "action_items": action_items,
         "key_decisions": decisions,
         "open_questions": questions,
         "rag_chain": rag_chain,
+        "display_language": mode_info["display_name"],
+        "is_translated": is_nepali_translate,
     }
 
 
@@ -230,14 +260,19 @@ def get_answer(rag_chain, question: str) -> str:
 
 
 def build_report(result: dict) -> str:
-    return (
+    lang_info = result.get("display_language", "Transcript")
+    report = (
         f"# {result['title']}\n\n"
+        f"**Language Mode**: {lang_info}\n\n"
         f"## Summary\n{result['summary']}\n\n"
         f"## Action items\n{result['action_items']}\n\n"
         f"## Key decisions\n{result['key_decisions']}\n\n"
         f"## Open questions\n{result['open_questions']}\n\n"
         f"## Transcript\n{result['transcript']}\n"
     )
+    if result.get("original_transcript"):
+        report += f"\n## Original Nepali Transcript (Devanagari)\n{result['original_transcript']}\n"
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -268,7 +303,23 @@ with st.sidebar:
             source_label = uploaded.name
             source = uploaded  # saved to disk only when the user clicks Analyze
 
-    language = st.selectbox("Spoken language", ["english", "hinglish"])
+    default_idx = 0
+    if st.session_state.language in LANGUAGE_OPTIONS:
+        default_idx = LANGUAGE_OPTIONS.index(st.session_state.language)
+
+    language = st.selectbox(
+        "Spoken language",
+        LANGUAGE_OPTIONS,
+        index=default_idx,
+    )
+
+    keep_original_nepali = False
+    if language == "Nepali speech → English text":
+        keep_original_nepali = st.checkbox(
+            "Keep original Devanagari transcript alongside English translation",
+            value=True,
+            help="Transcribes original Nepali speech in Devanagari script in addition to the English translation.",
+        )
 
     analyze = st.button(
         "Analyze video", type="primary", use_container_width=True, disabled=source is None
@@ -288,7 +339,11 @@ if analyze and source is not None:
     st.session_state.messages = []
     path = save_upload(source) if input_mode == "Upload a file" else source
     try:
-        st.session_state.result = run_pipeline_ui(path, language)
+        st.session_state.result = run_pipeline_ui(
+            path,
+            language,
+            keep_original_nepali=keep_original_nepali,
+        )
         st.session_state.source_label = source_label
         st.session_state.language = language
     except Exception as e:
@@ -334,7 +389,7 @@ read_min = max(1, round(words / 200))
 st.markdown(f'<div class="page-title">{result["title"]}</div>', unsafe_allow_html=True)
 st.markdown(
     f'<div class="meta">{st.session_state.source_label} &nbsp;|&nbsp; '
-    f'{st.session_state.language.capitalize()}</div>',
+    f'{result.get("display_language", st.session_state.language)}</div>',
     unsafe_allow_html=True,
 )
 st.markdown(
@@ -396,11 +451,42 @@ with tab_chat:
         st.rerun()
 
 with tab_transcript:
-    st.download_button(
-        "Download full report (.md)",
-        data=build_report(result),
-        file_name="video_notes.md",
-        mime="text/markdown",
-    )
+    col_dl1, col_dl2 = st.columns([1, 1])
+    with col_dl1:
+        st.download_button(
+            "Download full report (.md)",
+            data=build_report(result),
+            file_name="video_notes.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+    with col_dl2:
+        # Transcript .txt download button
+        if result.get("is_translated") or result.get("display_language") == "English":
+            txt_label = "Download English transcript (.txt)"
+            txt_filename = "english_transcript.txt"
+        else:
+            txt_label = "Download transcript (.txt)"
+            txt_filename = "transcript.txt"
+
+        st.download_button(
+            txt_label,
+            data=result["transcript"],
+            file_name=txt_filename,
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    # If original Nepali transcript was also generated, display it separately
+    if result.get("original_transcript"):
+        with st.expander("Original Nepali Transcript (नेपाली - Devanagari)", expanded=False):
+            st.download_button(
+                "Download original Nepali transcript (.txt)",
+                data=result["original_transcript"],
+                file_name="nepali_original_transcript.txt",
+                mime="text/plain",
+            )
+            st.write(result["original_transcript"])
+
     with st.container(border=True, height=480):
         st.write(result["transcript"])

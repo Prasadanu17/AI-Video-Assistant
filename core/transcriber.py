@@ -18,26 +18,37 @@ _model = None
 LANGUAGE_CONFIG = {
     # English
     "english": {"engine": "whisper", "whisper_code": "en", "default_task": "transcribe", "display_name": "English"},
+    "english transcription": {"engine": "whisper", "whisper_code": "en", "default_task": "transcribe", "display_name": "English"},
     "en": {"engine": "whisper", "whisper_code": "en", "default_task": "transcribe", "display_name": "English"},
+
     # Hindi
     "hindi": {"engine": "whisper", "whisper_code": "hi", "default_task": "transcribe", "display_name": "Hindi"},
     "hi": {"engine": "whisper", "whisper_code": "hi", "default_task": "transcribe", "display_name": "Hindi"},
+
     # Nepali Transcription (Devanagari script)
-    "nepali": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali"},
-    "ne": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali"},
+    "nepali": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali (Devanagari)"},
+    "nepali transcription": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali (Devanagari)"},
+    "ne": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali (Devanagari)"},
+
     # Nepali-to-English Translation
-    "nepali-to-english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-    "nepali_to_english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-    "nepali-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-    "ne-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-    "ne-to-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-    "nepali_translate": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali-to-english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali_to_english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali speech → english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali speech -> english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "ne-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "ne-to-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali_translate": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+
     # Auto-detection
     "auto": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
     "auto-detect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
     "autodetect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
+    "automatic language detection": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
+
     # Hinglish (Sarvam AI cloud translation)
     "hinglish": {"engine": "sarvam", "whisper_code": None, "default_task": "transcribe", "display_name": "Hinglish (Sarvam AI)"},
+    "hinglish transcription using the existing sarvam integration": {"engine": "sarvam", "whisper_code": None, "default_task": "transcribe", "display_name": "Hinglish (Sarvam AI)"},
     "sarvam": {"engine": "sarvam", "whisper_code": None, "default_task": "transcribe", "display_name": "Hinglish (Sarvam AI)"},
 }
 
@@ -56,12 +67,34 @@ def resolve_language_mode(language: str = "english", task: str = None) -> dict:
     if not language:
         normalized = "english"
     else:
-        normalized = str(language).strip().lower().replace(" ", "-").replace("_", "-")
+        normalized = str(language).strip().lower().replace("→", "->")
+        # Direct lookup first
+        if normalized in LANGUAGE_CONFIG:
+            config = LANGUAGE_CONFIG[normalized]
+            resolved_task = task if task in ("transcribe", "translate") else config["default_task"]
+            return {
+                "engine": config["engine"],
+                "whisper_code": config["whisper_code"],
+                "task": resolved_task,
+                "display_name": config["display_name"],
+                "mode_key": normalized,
+            }
 
-    config = LANGUAGE_CONFIG.get(normalized)
-    if config is None:
+        # Normalize spaces and underscores to dashes
+        slug = normalized.replace(" ", "-").replace("_", "-")
+        if slug in LANGUAGE_CONFIG:
+            config = LANGUAGE_CONFIG[slug]
+            resolved_task = task if task in ("transcribe", "translate") else config["default_task"]
+            return {
+                "engine": config["engine"],
+                "whisper_code": config["whisper_code"],
+                "task": resolved_task,
+                "display_name": config["display_name"],
+                "mode_key": slug,
+            }
+
         # Check standard Whisper tokenizer languages
-        clean_code = normalized.replace("-", "")
+        clean_code = slug.replace("-", "")
         import whisper.tokenizer as tok
         if clean_code in tok.LANGUAGES:
             config = {
@@ -91,6 +124,21 @@ def resolve_language_mode(language: str = "english", task: str = None) -> dict:
     }
 
 
+def validate_whisper_model(model, language: str = None, task: str = None):
+    """
+    Validate that the loaded Whisper model supports multilingual processing.
+    Raises ValueError if an English-only model (.en) is used for non-English transcription or translation.
+    """
+    is_multilingual = getattr(model, "is_multilingual", True)
+    if not is_multilingual:
+        if (language and language != "en") or task == "translate":
+            raise ValueError(
+                f"The loaded Whisper model '{WHISPER_MODEL}' is an English-only model (.en) "
+                f"and does not support language='{language}' or task='{task}'. "
+                "Please configure a multilingual Whisper model (e.g., 'small', 'base', 'medium') in WHISPER_MODEL."
+            )
+
+
 def load_model():
     """Load and cache the local Whisper model."""
     global _model
@@ -105,7 +153,8 @@ def transcribe_chunk_whisper(
     chunk_path: str,
     language: str = None,
     task: str = "transcribe",
-) -> str:
+    return_segments: bool = False,
+) -> str | dict:
     """
     Transcribe or translate an audio chunk using local Whisper.
     
@@ -113,11 +162,18 @@ def transcribe_chunk_whisper(
         chunk_path: Path to the WAV audio chunk.
         language: Whisper language code ('en', 'hi', 'ne', or None for auto-detect).
         task: 'transcribe' (default) or 'translate' (translates to English).
+        return_segments: Whether to return full segments with timestamps.
     """
     if not os.path.exists(chunk_path):
         raise FileNotFoundError(f"Audio chunk file not found: {chunk_path}")
 
+    # Check for empty / zero-byte chunk
+    if os.path.getsize(chunk_path) == 0:
+        print(f"[!] Warning: Audio chunk {chunk_path} is 0 bytes. Skipping.")
+        return {"text": "", "segments": []} if return_segments else ""
+
     model = load_model()
+    validate_whisper_model(model, language=language, task=task)
 
     transcribe_kwargs = {"task": task}
     if language is not None:
@@ -125,10 +181,16 @@ def transcribe_chunk_whisper(
 
     try:
         result = model.transcribe(chunk_path, **transcribe_kwargs)
-        return result.get("text", "")
+        text = result.get("text", "").strip()
+        if return_segments:
+            return {"text": text, "segments": result.get("segments", [])}
+        return text
     except Exception as e:
-        print(f"Error during Whisper transcription for {chunk_path}: {e}")
-        raise
+        print(f"[!] Error during Whisper transcription for {chunk_path}: {e}")
+        # Return empty text safely so one bad chunk does not drop the entire run
+        if return_segments:
+            return {"text": "", "segments": []}
+        return ""
 
 
 def _send_to_sarvam(piece_path: str) -> str:
@@ -193,17 +255,21 @@ def transcribe_chunk(
     chunk_path: str,
     language: str = "english",
     task: str = None,
-) -> str:
+    return_segments: bool = False,
+) -> str | dict:
     """
     Route one chunk to Whisper or Sarvam depending on the language/mode configuration.
     """
     cfg = resolve_language_mode(language=language, task=task)
     if cfg["engine"] == "sarvam":
-        return transcribe_chunk_sarvam(chunk_path)
+        text = transcribe_chunk_sarvam(chunk_path)
+        return {"text": text, "segments": []} if return_segments else text
+
     return transcribe_chunk_whisper(
         chunk_path,
         language=cfg["whisper_code"],
         task=cfg["task"],
+        return_segments=return_segments,
     )
 
 
@@ -211,12 +277,27 @@ def transcribe_all(
     chunks: list,
     language: str = "english",
     task: str = None,
-) -> str:
+    return_original: bool = False,
+    chunk_duration_seconds: float = 180.0,
+) -> str | dict:
     """
     Transcribe all audio chunks sequentially with the specified language mode and task.
+
+    Args:
+        chunks: List of WAV chunk file paths.
+        language: Language name or mode key.
+        task: Explicit task ('transcribe' or 'translate').
+        return_original: If True and translating from Nepali, also generates original Devanagari transcript.
+        chunk_duration_seconds: Estimated duration per chunk for timestamp offsets.
+
+    Returns:
+        str if return_original is False;
+        dict with {"transcript", "original_transcript", "segments"} if return_original is True.
     """
     if not chunks:
         print("[!] No audio chunks provided to transcribe.")
+        if return_original:
+            return {"transcript": "", "original_transcript": "", "segments": []}
         return ""
 
     cfg = resolve_language_mode(language=language, task=task)
@@ -231,18 +312,69 @@ def transcribe_all(
         )
 
     full_transcript = ""
+    original_transcript = "" if return_original else None
+    all_segments = []
+
+    is_translating_nepali = (cfg["whisper_code"] == "ne" and cfg["task"] == "translate")
+
     for i, chunk in enumerate(chunks):
-        print(f"Transcribing chunk {i + 1}/{len(chunks)}...")
-        text = transcribe_chunk(chunk, language=language, task=task)
-        if text:
+        print(f"Processing chunk {i + 1}/{len(chunks)}...")
+        chunk_offset = i * chunk_duration_seconds
+
+        # 1. Primary pass (Translation or Transcription)
+        res = transcribe_chunk(chunk, language=language, task=task, return_segments=True)
+        text = res["text"] if isinstance(res, dict) else str(res)
+        segments = res.get("segments", []) if isinstance(res, dict) else []
+
+        if text and text.strip():
             full_transcript += text.strip() + " "
 
+        for seg in segments:
+            all_segments.append({
+                "start": chunk_offset + seg.get("start", 0.0),
+                "end": chunk_offset + seg.get("end", 0.0),
+                "text": seg.get("text", "").strip(),
+            })
+
+        # 2. Dual pass for original Nepali Devanagari text if requested
+        if return_original and is_translating_nepali:
+            print(f"  -> Transcribing original Nepali (Devanagari) for chunk {i + 1}...")
+            orig_text = transcribe_chunk_whisper(chunk, language="ne", task="transcribe")
+            if orig_text and orig_text.strip():
+                original_transcript += orig_text.strip() + " "
+
     print("Transcription complete.")
-    return full_transcript.strip()
+    cleaned_transcript = full_transcript.strip()
+
+    if return_original:
+        return {
+            "transcript": cleaned_transcript,
+            "original_transcript": (original_transcript.strip() if original_transcript else None),
+            "segments": all_segments,
+            "display_language": cfg["display_name"],
+            "is_translated": cfg["task"] == "translate",
+        }
+
+    return cleaned_transcript
 
 
 def translate_nepali_to_english(chunks: list) -> str:
     """
-    Convenience helper to transcribe and translate Nepali audio chunks directly to English.
+    Transcribe and translate Nepali audio chunks directly to English.
     """
     return transcribe_all(chunks, language="nepali-to-english")
+
+
+def transcribe_nepali(chunks: list) -> str:
+    """
+    Transcribe Nepali audio chunks in original Nepali (Devanagari script).
+    """
+    return transcribe_all(chunks, language="nepali")
+
+
+def transcribe_nepali_dual(chunks: list) -> dict:
+    """
+    Transcribe Nepali audio chunks to both English translation and original Devanagari transcript.
+    Returns: dict with {"transcript": <English>, "original_transcript": <Nepali>, "segments": [...]}
+    """
+    return transcribe_all(chunks, language="nepali-to-english", return_original=True)
