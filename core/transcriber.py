@@ -279,6 +279,7 @@ def transcribe_all(
     task: str = None,
     return_original: bool = False,
     chunk_duration_seconds: float = 180.0,
+    progress_callback = None,
 ) -> str | dict:
     """
     Transcribe all audio chunks sequentially with the specified language mode and task.
@@ -289,11 +290,14 @@ def transcribe_all(
         task: Explicit task ('transcribe' or 'translate').
         return_original: If True and translating from Nepali, also generates original Devanagari transcript.
         chunk_duration_seconds: Estimated duration per chunk for timestamp offsets.
+        progress_callback: Optional callable(current_chunk_idx, total_chunks, message) for UI progress indicators.
 
     Returns:
         str if return_original is False;
         dict with {"transcript", "original_transcript", "segments"} if return_original is True.
     """
+    import time
+    t_start = time.perf_counter()
     if not chunks:
         print("[!] No audio chunks provided to transcribe.")
         if return_original:
@@ -317,8 +321,17 @@ def transcribe_all(
 
     is_translating_nepali = (cfg["whisper_code"] == "ne" and cfg["task"] == "translate")
 
+    total_chunks = len(chunks)
     for i, chunk in enumerate(chunks):
-        print(f"Processing chunk {i + 1}/{len(chunks)}...")
+        t_chunk_start = time.perf_counter()
+        msg = f"Transcribing chunk {i + 1}/{total_chunks}..."
+        print(f"[*] {msg}")
+        if progress_callback:
+            try:
+                progress_callback(i + 1, total_chunks, msg)
+            except Exception:
+                pass
+
         chunk_offset = i * chunk_duration_seconds
 
         # 1. Primary pass (Translation or Transcription)
@@ -343,7 +356,11 @@ def transcribe_all(
             if orig_text and orig_text.strip():
                 original_transcript += orig_text.strip() + " "
 
-    print("Transcription complete.")
+        chunk_elapsed = time.perf_counter() - t_chunk_start
+        print(f"[*] Chunk {i + 1}/{total_chunks} completed in {chunk_elapsed:.2f}s")
+
+    total_elapsed = time.perf_counter() - t_start
+    print(f"[+] Transcription complete in {total_elapsed:.2f}s across {total_chunks} chunk(s).")
     cleaned_transcript = full_transcript.strip()
 
     if return_original:
@@ -353,28 +370,29 @@ def transcribe_all(
             "segments": all_segments,
             "display_language": cfg["display_name"],
             "is_translated": cfg["task"] == "translate",
+            "transcription_time": total_elapsed,
         }
 
     return cleaned_transcript
 
 
-def translate_nepali_to_english(chunks: list) -> str:
+def translate_nepali_to_english(chunks: list, **kwargs) -> str:
     """
     Transcribe and translate Nepali audio chunks directly to English.
     """
-    return transcribe_all(chunks, language="nepali-to-english")
+    return transcribe_all(chunks, language="nepali-to-english", **kwargs)
 
 
-def transcribe_nepali(chunks: list) -> str:
+def transcribe_nepali(chunks: list, **kwargs) -> str:
     """
     Transcribe Nepali audio chunks in original Nepali (Devanagari script).
     """
-    return transcribe_all(chunks, language="nepali")
+    return transcribe_all(chunks, language="nepali", **kwargs)
 
 
-def transcribe_nepali_dual(chunks: list) -> dict:
+def transcribe_nepali_dual(chunks: list, **kwargs) -> dict:
     """
     Transcribe Nepali audio chunks to both English translation and original Devanagari transcript.
     Returns: dict with {"transcript": <English>, "original_transcript": <Nepali>, "segments": [...]}
     """
-    return transcribe_all(chunks, language="nepali-to-english", return_original=True)
+    return transcribe_all(chunks, language="nepali-to-english", return_original=True, **kwargs)

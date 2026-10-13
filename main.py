@@ -21,34 +21,62 @@ from core.rag_engine import build_rag_chain, ask_question
 
 def run_pipeline(source: str, language: str = "english") -> dict:
     print("\nStarting AI Video Assistant...")
+    stage_timings = {}
+    t_start = time.perf_counter()
 
+    t0 = time.perf_counter()
     chunks = process_input(source)
+    stage_timings["Audio Preparation"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     transcript = transcribe_all(chunks, language=language)
+    stage_timings["Speech Transcription"] = time.perf_counter() - t0
     print(f"\nRaw transcription (first 300 chars):\n{transcript[:300]}...\n")
 
+    t0 = time.perf_counter()
     print("Generating title...")
     title = generate_title(transcript)
+    stage_timings["Title Generation"] = time.perf_counter() - t0
     time.sleep(1.0)
 
+    t0 = time.perf_counter()
     print("Generating summary...")
     summary = summarize(transcript)
+    stage_timings["Summary Generation"] = time.perf_counter() - t0
     time.sleep(1.0)
 
+    t0 = time.perf_counter()
     print("Extracting action items...")
     actions_item = extract_action_items(transcript)
+    stage_timings["Action Items"] = time.perf_counter() - t0
     time.sleep(1.0)
 
+    t0 = time.perf_counter()
     print("Extracting key decisions...")
     decisions = extract_key_decisions(transcript)
+    stage_timings["Key Decisions"] = time.perf_counter() - t0
     time.sleep(1.0)
 
+    t0 = time.perf_counter()
     print("Extracting open questions...")
     questions = extract_questions(transcript)
+    stage_timings["Open Questions"] = time.perf_counter() - t0
     time.sleep(1.0)
 
+    t0 = time.perf_counter()
     print("Building RAG vector store and chain...")
     rag_chain = build_rag_chain(transcript)
+    stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
+
+    total_time = time.perf_counter() - t_start
+    stage_timings["Total Pipeline Time"] = total_time
+
+    print("\n" + "=" * 60)
+    print("STAGE TIMINGS BREAKDOWN")
+    print("=" * 60)
+    for k, v in stage_timings.items():
+        print(f"  - {k:<25}: {v:>6.2f}s")
+    print("=" * 60)
 
     return {
         "transcript": transcript,
@@ -61,6 +89,7 @@ def run_pipeline(source: str, language: str = "english") -> dict:
         "open_questions": questions,
         "questions": questions,
         "rag_chain": rag_chain,
+        "stage_timings": stage_timings,
     }
 
 

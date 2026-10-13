@@ -173,22 +173,41 @@ def save_upload(uploaded) -> str:
 
 
 def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False) -> dict:
-    """Same steps as the CLI pipeline, with live progress in the UI."""
+    """Same steps as the CLI pipeline, with live progress in the UI and stage-by-stage timing metrics."""
     mode_info = resolve_language_mode(language)
     is_nepali_translate = (mode_info.get("whisper_code") == "ne" and mode_info.get("task") == "translate")
 
+    stage_timings = {}
+    t_pipeline_start = time.perf_counter()
+
     with st.status("Working on your video", expanded=True) as status:
-        st.write("Downloading and preparing audio")
+        progress_bar = st.progress(0.0, text="Starting processing...")
+
+        st.write("📥 Downloading and preparing audio...")
+        t0 = time.perf_counter()
         chunks = process_input(source)
+        stage_timings["Audio Preparation"] = time.perf_counter() - t0
+        st.write(f"✓ Audio prepared into {len(chunks)} chunk(s) ({stage_timings['Audio Preparation']:.2f}s)")
+        progress_bar.progress(0.15, text="Audio prepared. Starting transcription...")
+
+        t0 = time.perf_counter()
+        def on_transcribe_chunk(curr, total, msg):
+            pct = 0.15 + 0.50 * (curr / max(1, total))
+            progress_bar.progress(min(pct, 0.65), text=f"Transcribing speech: chunk {curr}/{total}...")
+            st.write(f"  • Transcribing chunk {curr}/{total}...")
 
         if is_nepali_translate:
-            st.write("Translating Nepali speech to English")
+            st.write("🎙️ Translating Nepali speech to English...")
             if keep_original_nepali:
-                st.write("Transcribing original Nepali speech (Devanagari)")
-            res = transcribe_all(chunks, language=language, return_original=keep_original_nepali)
+                st.write("🎙️ Transcribing original Nepali speech (Devanagari)...")
+            res = transcribe_all(chunks, language=language, return_original=keep_original_nepali, progress_callback=on_transcribe_chunk)
         else:
-            st.write(f"Transcribing speech ({mode_info['display_name']})")
-            res = transcribe_all(chunks, language=language, return_original=False)
+            st.write(f"🎙️ Transcribing speech ({mode_info['display_name']})...")
+            res = transcribe_all(chunks, language=language, return_original=False, progress_callback=on_transcribe_chunk)
+
+        stage_timings["Speech Transcription"] = time.perf_counter() - t0
+        st.write(f"✓ Transcription complete ({stage_timings['Speech Transcription']:.2f}s)")
+        progress_bar.progress(0.65, text="Transcription finished. Generating summary & notes...")
 
         if isinstance(res, dict):
             transcript = res.get("transcript", "")
@@ -197,30 +216,51 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
             transcript = str(res)
             original_transcript = None
 
-        st.write("Writing title")
+        st.write("✍️ Writing title...")
+        t0 = time.perf_counter()
         title = generate_title(transcript)
+        stage_timings["Title Generation"] = time.perf_counter() - t0
+        progress_bar.progress(0.70, text="Writing summary...")
         time.sleep(CALL_DELAY_SECONDS)
 
-        st.write("Writing summary")
+        st.write("📝 Writing summary...")
+        t0 = time.perf_counter()
         summary = summarize(transcript)
+        stage_timings["Summary Generation"] = time.perf_counter() - t0
+        progress_bar.progress(0.80, text="Finding action items...")
         time.sleep(CALL_DELAY_SECONDS)
 
-        st.write("Finding action items")
+        st.write("📋 Finding action items...")
+        t0 = time.perf_counter()
         action_items = extract_action_items(transcript)
+        stage_timings["Action Items"] = time.perf_counter() - t0
+        progress_bar.progress(0.85, text="Finding key decisions...")
         time.sleep(CALL_DELAY_SECONDS)
 
-        st.write("Finding key decisions")
+        st.write("💡 Finding key decisions...")
+        t0 = time.perf_counter()
         decisions = extract_key_decisions(transcript)
+        stage_timings["Key Decisions"] = time.perf_counter() - t0
+        progress_bar.progress(0.90, text="Finding open questions...")
         time.sleep(CALL_DELAY_SECONDS)
 
-        st.write("Finding open questions")
+        st.write("❓ Finding open questions...")
+        t0 = time.perf_counter()
         questions = extract_questions(transcript)
+        stage_timings["Open Questions"] = time.perf_counter() - t0
+        progress_bar.progress(0.95, text="Indexing transcript into ChromaDB...")
         time.sleep(CALL_DELAY_SECONDS)
 
-        st.write("Indexing transcript for chat")
+        st.write("🔍 Indexing transcript for chat...")
+        t0 = time.perf_counter()
         rag_chain = build_rag_chain(transcript)
+        stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
 
-        status.update(label="Done", state="complete", expanded=False)
+        t_total = time.perf_counter() - t_pipeline_start
+        stage_timings["Total Pipeline Time"] = t_total
+
+        progress_bar.progress(1.0, text=f"Done in {t_total:.1f}s!")
+        status.update(label=f"Done in {t_total:.1f}s", state="complete", expanded=False)
 
     return {
         "transcript": transcript,
@@ -233,6 +273,7 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
         "rag_chain": rag_chain,
         "display_language": mode_info["display_name"],
         "is_translated": is_nepali_translate,
+        "stage_timings": stage_timings,
     }
 
 
@@ -401,6 +442,19 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+if "stage_timings" in result and result["stage_timings"]:
+    st_timings = result["stage_timings"]
+    total_time = st_timings.get("Total Pipeline Time", 0.0)
+    transcribe_time = st_timings.get("Speech Transcription", 0.0)
+    pct_transcribe = (transcribe_time / total_time * 100) if total_time > 0 else 0
+    with st.expander(f"⏱️ Pipeline Performance & Timings (Total: {total_time:.1f}s — Transcription: {pct_transcribe:.0f}%)", expanded=False):
+        t_cols = st.columns(4)
+        t_cols[0].metric("Audio Prep", f"{st_timings.get('Audio Preparation', 0.0):.2f}s")
+        t_cols[1].metric("Transcription", f"{transcribe_time:.2f}s", delta=f"{pct_transcribe:.0f}% of total" if total_time else None, delta_color="inverse")
+        llm_total = sum(st_timings.get(k, 0.0) for k in ["Title Generation", "Summary Generation", "Action Items", "Key Decisions", "Open Questions"])
+        t_cols[2].metric("LLM Analysis", f"{llm_total:.2f}s")
+        t_cols[3].metric("Vector Store", f"{st_timings.get('ChromaDB Indexing', 0.0):.2f}s")
 
 tab_summary, tab_notes, tab_chat, tab_transcript = st.tabs(
     ["Summary", "Action items and decisions", "Ask the video", "Transcript"]
