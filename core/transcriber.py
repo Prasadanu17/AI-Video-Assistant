@@ -1,4 +1,5 @@
 import os
+import threading
 import requests
 from pydub import AudioSegment
 import whisper
@@ -13,6 +14,9 @@ SARVAM_STT_TRANSLATE_URL = "https://api.sarvam.ai/speech-to-text-translate"
 SARVAM_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v2.5")
 
 _model = None
+_faster_model = None
+_openai_model = None
+_model_lock = threading.Lock()
 
 # Comprehensive Language Mapping & Alias Normalization
 LANGUAGE_CONFIG = {
@@ -129,7 +133,14 @@ def validate_whisper_model(model, language: str = None, task: str = None):
     Validate that the loaded Whisper model supports multilingual processing.
     Raises ValueError if an English-only model (.en) is used for non-English transcription or translation.
     """
-    is_multilingual = getattr(model, "is_multilingual", True)
+    is_multilingual = getattr(model, "is_multilingual", None)
+    if is_multilingual is None:
+        if hasattr(model, "model") and hasattr(model.model, "is_multilingual"):
+            is_multilingual = model.model.is_multilingual
+        else:
+            model_name = getattr(model, "model_size_or_path", WHISPER_MODEL)
+            is_multilingual = not str(model_name).endswith(".en")
+
     if not is_multilingual:
         if (language and language != "en") or task == "translate":
             raise ValueError(
@@ -139,13 +150,75 @@ def validate_whisper_model(model, language: str = None, task: str = None):
             )
 
 
+def get_device_and_compute():
+    """Detect available hardware accelerator and optimal compute type for Whisper."""
+    env_device = os.getenv("WHISPER_DEVICE", "").strip().lower()
+    env_compute = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
+
+    if env_device in ("cuda", "cpu"):
+        device = env_device
+    else:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+    if env_compute:
+        compute_type = env_compute
+    else:
+        compute_type = "float16" if device == "cuda" else "int8"
+
+    return device, compute_type
+
+
+def load_faster_whisper_model(model_name: str = None):
+    """Load and cache the faster-whisper model (thread-safe singleton)."""
+    global _faster_model
+    target_model = model_name or WHISPER_MODEL
+    with _model_lock:
+        if _faster_model is None:
+            from faster_whisper import WhisperModel
+            device, compute_type = get_device_and_compute()
+            cpu_threads = min(os.cpu_count() or 4, 8)
+            print(f"Loading faster-whisper model '{target_model}' on {device} ({compute_type}, {cpu_threads} threads)...")
+            _faster_model = WhisperModel(
+                target_model,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+            )
+            print(f"faster-whisper model '{target_model}' loaded successfully.")
+    return _faster_model
+
+
+def load_openai_whisper_model(model_name: str = None):
+    """Load and cache the fallback OpenAI Whisper model (thread-safe singleton)."""
+    global _openai_model
+    target_model = model_name or WHISPER_MODEL
+    with _model_lock:
+        if _openai_model is None:
+            print(f"Loading fallback OpenAI Whisper model: {target_model} ...")
+            _openai_model = whisper.load_model(target_model)
+            print("OpenAI Whisper model loaded.")
+    return _openai_model
+
+
 def load_model():
-    """Load and cache the local Whisper model."""
+    """
+    Load and cache the active local Whisper model.
+    Prioritizes faster-whisper with INT8 CPU or float16 GPU acceleration,
+    falling back to standard openai-whisper if faster-whisper is unavailable.
+    """
     global _model
-    if _model is None:
-        print(f"Loading Whisper model: {WHISPER_MODEL} ...")
-        _model = whisper.load_model(WHISPER_MODEL)
-        print("Whisper model loaded.")
+    use_faster = os.getenv("USE_FASTER_WHISPER", "true").strip().lower() in ("1", "true", "yes")
+    if use_faster:
+        try:
+            _model = load_faster_whisper_model()
+            return _model
+        except Exception as e:
+            print(f"[!] Warning: Failed to load faster-whisper ({e}). Falling back to OpenAI Whisper.")
+    _model = load_openai_whisper_model()
     return _model
 
 
@@ -156,7 +229,7 @@ def transcribe_chunk_whisper(
     return_segments: bool = False,
 ) -> str | dict:
     """
-    Transcribe or translate an audio chunk using local Whisper.
+    Transcribe or translate an audio chunk using faster-whisper or fallback Whisper.
     
     Args:
         chunk_path: Path to the WAV audio chunk.
@@ -179,12 +252,45 @@ def transcribe_chunk_whisper(
     if language is not None:
         transcribe_kwargs["language"] = language
 
+    # Configure beam size for faster-whisper (default 1 for fast greedy decoding)
+    if type(model).__name__ == "WhisperModel":
+        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+
     try:
-        result = model.transcribe(chunk_path, **transcribe_kwargs)
-        text = result.get("text", "").strip()
+        raw_result = model.transcribe(chunk_path, **transcribe_kwargs)
+
+        # 1. Faster-whisper output format: (segments_generator, info)
+        if isinstance(raw_result, tuple) and len(raw_result) == 2:
+            segments_iter, _ = raw_result
+            text_parts = []
+            segments = []
+            for seg in segments_iter:
+                seg_text = getattr(seg, "text", "").strip()
+                if seg_text:
+                    text_parts.append(seg_text)
+                segments.append({
+                    "start": float(getattr(seg, "start", 0.0)),
+                    "end": float(getattr(seg, "end", 0.0)),
+                    "text": seg_text,
+                })
+            text = " ".join(text_parts).strip()
+            if return_segments:
+                return {"text": text, "segments": segments}
+            return text
+
+        # 2. OpenAI Whisper / Mock dict format: {"text": "...", "segments": [...]}
+        if isinstance(raw_result, dict):
+            text = raw_result.get("text", "").strip()
+            if return_segments:
+                return {"text": text, "segments": raw_result.get("segments", [])}
+            return text
+
+        # 3. String format
+        text = str(raw_result).strip()
         if return_segments:
-            return {"text": text, "segments": result.get("segments", [])}
+            return {"text": text, "segments": []}
         return text
+
     except Exception as e:
         print(f"[!] Error during Whisper transcription for {chunk_path}: {e}")
         # Return empty text safely so one bad chunk does not drop the entire run

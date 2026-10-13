@@ -13,7 +13,8 @@ ffmpeg-python>=0.2.0       # Wrapper around ffmpeg (ffmpeg binary must be instal
 # ------------------------------
 # Transcription (local Whisper)
 # ------------------------------
-openai-whisper>=20231117   # Local Whisper model
+faster-whisper>=1.0.0      # High-performance Whisper with CTranslate2 INT8 quantization
+openai-whisper>=20231117   # Local Whisper model (reliable fallback)
 torch>=2.2.0                # Required by Whisper (install CUDA build separately if using GPU)
 
 # ------------------------------
