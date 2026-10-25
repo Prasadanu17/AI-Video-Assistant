@@ -72,15 +72,17 @@ def invoke_with_retry(chain, inputs, max_retries: int = 5, initial_delay: float 
 
 
 def format_docs(docs: list) -> str:
-    """Format retrieved documents with chunk index labels for clear LLM grounding."""
+    """Format retrieved documents with chunk index labels and timestamps for clear LLM grounding."""
     if not docs:
         return "No transcript context available."
 
     formatted = []
     for i, doc in enumerate(docs):
         chunk_idx = doc.metadata.get("chunk_index", i)
+        ts_label = doc.metadata.get("timestamp_label", "")
+        header = f"[Transcript Excerpt {i + 1} (Chunk #{chunk_idx}{f', {ts_label}' if ts_label else ''})]"
         formatted.append(
-            f"[Transcript Excerpt {i + 1} (Chunk #{chunk_idx})]:\n{doc.page_content.strip()}"
+            f"{header}:\n{doc.page_content.strip()}"
         )
     return "\n\n".join(formatted)
 
@@ -113,6 +115,7 @@ def build_rag_chain(
     session_id: str = None,
     k: int = DEFAULT_K,
     collection_name: str = COLLECTION_NAME,
+    segments: list = None,
     verbose: bool = False,
 ):
     """
@@ -127,6 +130,7 @@ def build_rag_chain(
         transcript=transcript,
         session_id=active_session_id,
         collection_name=collection_name,
+        segments=segments,
         clear_existing=True,
     )
     retriever = get_retriever(vector_store, session_id=active_session_id, k=k)

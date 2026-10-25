@@ -40,7 +40,7 @@ class LiveTranscriptSegment:
 class LiveTranscript:
     """Thread-safe state container holding the progressive live transcript."""
     segments: List[LiveTranscriptSegment] = field(default_factory=list)
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _lock: threading.RLock = field(default_factory=threading.RLock)
     is_busy: bool = False
     total_audio_seconds: float = 0.0
     total_inference_seconds: float = 0.0
@@ -65,6 +65,8 @@ class LiveTranscript:
     def get_snapshot(self) -> dict:
         """Return a thread-safe copy of the live transcript state for UI rendering."""
         with self._lock:
+            text_val = " ".join(s.text.strip() for s in self.segments if s.text.strip()).strip()
+            rtf = (self.total_inference_seconds / self.total_audio_seconds) if self.total_audio_seconds > 0.0 else 0.0
             return {
                 "segments": [
                     {
@@ -77,12 +79,12 @@ class LiveTranscript:
                     }
                     for s in self.segments
                 ],
-                "full_text": self.full_text,
+                "full_text": text_val,
                 "is_busy": self.is_busy,
                 "segment_count": len(self.segments),
                 "total_audio_seconds": self.total_audio_seconds,
                 "total_inference_seconds": self.total_inference_seconds,
-                "real_time_factor": self.real_time_factor,
+                "real_time_factor": rtf,
                 "last_error": self.last_error,
             }
 
@@ -234,7 +236,7 @@ class LiveTranscriber:
             print("[LiveTranscriber] Warning: Queue full! Audio backpressure detected.")
             return False
 
-    def stop(self, timeout: float = 15.0) -> str:
+    def stop(self, timeout: float = 30.0) -> str:
         """
         Stop worker, flush all remaining audio chunks in the queue, and return final transcript.
         """
@@ -341,6 +343,11 @@ class LiveTranscriber:
                         pass
             t_inf = time.perf_counter() - t0
 
+        # Record audio duration and inference timing for every processed chunk
+        with self.transcript._lock:
+            self.transcript.total_audio_seconds += chunk_duration
+            self.transcript.total_inference_seconds += t_inf
+
         clean_text = text.strip()
         if not clean_text:
             return
@@ -364,8 +371,6 @@ class LiveTranscriber:
         self._segment_index += 1
 
         self.transcript.add_segment(segment)
-        self.transcript.total_audio_seconds += chunk_duration
-        self.transcript.total_inference_seconds += t_inf
 
         if self.on_segment_callback:
             try:

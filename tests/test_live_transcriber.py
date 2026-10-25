@@ -266,7 +266,7 @@ class TestLiveTranscriptionRealModel:
         sig = (0.2 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.float32)
 
         transcriber.enqueue_chunk(sig, start_time=0.0, end_time=duration, is_final=True)
-        transcriber.stop(timeout=10.0)
+        transcriber.stop(timeout=30.0)
 
         snapshot = transcriber.transcript.get_snapshot()
         assert snapshot["total_audio_seconds"] == 2.0

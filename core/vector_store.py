@@ -38,6 +38,7 @@ def build_vector_store(
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     clear_existing: bool = True,
     metadata_extra: dict = None,
+    segments: list = None,
 ) -> Chroma:
     """
     Split the transcript into semantically rich chunks and index in ChromaDB.
@@ -75,6 +76,21 @@ def build_vector_store(
             "session_id": clean_session_id,
             **base_meta,
         }
+        # If segments with start/end are provided, calculate timeline window for this chunk
+        if segments:
+            matching_starts = [
+                s["start"] for s in segments
+                if s.get("text", "").strip() and s.get("text", "").strip()[:20].lower() in chunk.lower()
+            ]
+            matching_ends = [
+                s["end"] for s in segments
+                if s.get("text", "").strip() and s.get("text", "").strip()[-20:].lower() in chunk.lower()
+            ]
+            if matching_starts and matching_ends:
+                meta["start_time"] = min(matching_starts)
+                meta["end_time"] = max(matching_ends)
+                meta["timestamp_label"] = f"[{int(meta['start_time']//60):02d}:{int(meta['start_time']%60):02d} - {int(meta['end_time']//60):02d}:{int(meta['end_time']%60):02d}]"
+
         docs.append(Document(page_content=chunk, metadata=meta))
 
     embeddings = get_embeddings()
