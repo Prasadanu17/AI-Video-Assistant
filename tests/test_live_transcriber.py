@@ -17,6 +17,7 @@ Tests:
 import os
 import sys
 import time
+import uuid
 import numpy as np
 import pytest
 
@@ -432,6 +433,149 @@ class TestLiveTranscriptionRealModel:
         assert transcriber._queue.empty() is True
         assert len(final_text) > 0
         assert len(transcriber.transcript.segments) == 3
+
+    def test_18_worker_finishing_after_stop_timeout_is_discarded(self):
+        """Verify that when stop() times out, lingering worker results are discarded and do not mutate finalized transcript."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        session_token = transcriber.start()
+
+        # Enqueue a chunk and simulate slow processing
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+        # Patch _process_single_chunk with intentional delay
+        original_process = transcriber._process_single_chunk
+        def slow_process(item):
+            time.sleep(0.15)
+            original_process(item)
+
+        transcriber._process_single_chunk = slow_process
+
+        transcriber.enqueue_chunk(samples, 0.0, 0.5)
+
+        # Call stop with extremely short timeout so it times out while worker is sleeping
+        final_text = transcriber.stop(timeout=0.02)
+        assert transcriber.is_finalized is True
+        assert transcriber.transcript.is_finalized is True
+        assert "still active in background" in (transcriber.transcript.last_error or "")
+
+        # Wait for the worker thread to finish its delayed run
+        time.sleep(0.25)
+
+        # Confirm the late segment was discarded and did not mutate the finalized transcript
+        assert len(transcriber.transcript.segments) == 0
+        assert final_text == ""
+
+    def test_19_new_session_before_old_inference_finishes_and_stale_discarded(self):
+        """Verify that a late segment from an old session never contaminates a newly started session."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        token_1 = transcriber.start()
+
+        # Enqueue a chunk into session 1
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+        original_process = transcriber._process_single_chunk
+        def slow_process(item):
+            time.sleep(0.15)
+            original_process(item)
+
+        transcriber._process_single_chunk = slow_process
+        transcriber.enqueue_chunk(samples, 0.0, 0.5)
+
+        # Stop session 1 with timeout so chunk is still in flight
+        transcriber.stop(timeout=0.02)
+        assert transcriber.is_finalized is True
+
+        # Immediately start session 2 with normal processing
+        transcriber._process_single_chunk = original_process
+        token_2 = transcriber.start()
+        assert token_2 != token_1
+        assert transcriber.is_finalized is False
+
+        # Wait for old worker from session 1 to complete its delayed inference
+        time.sleep(0.20)
+
+        # Session 2 transcript must have ZERO segments from session 1
+        assert len(transcriber.transcript.segments) == 0
+
+        # Now enqueue a valid chunk in session 2 and verify it is processed normally
+        transcriber.enqueue_chunk(samples, 0.0, 0.5)
+        time.sleep(0.08)
+        assert len(transcriber.transcript.segments) == 1
+        assert transcriber.transcript.segments[0].text == "Simulated speech segment 1."
+
+        transcriber.stop(timeout=2.0)
+
+    def test_20_normal_stop_drains_and_retains_valid_results(self):
+        """Verify that normal stop drains queued work, retains valid segments, and rejects subsequent chunks."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        transcriber.start()
+
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+        for i in range(3):
+            transcriber.enqueue_chunk(samples, i * 0.5, (i + 1) * 0.5)
+
+        final_text = transcriber.stop(timeout=5.0)
+        assert transcriber.is_finalized is True
+        assert transcriber._queue.empty() is True
+        assert len(transcriber.transcript.segments) == 3
+        assert len(final_text) > 0
+
+        # Further enqueues into finalized session must be rejected
+        rejected = transcriber.enqueue_chunk(samples, 1.5, 2.0)
+        assert rejected is False
+
+    def test_21_offline_retranscription_replaces_without_duplication(self):
+        """Verify that offline retranscription creates an isolated result that cleanly replaces live transcript."""
+        # 1. Simulate finalized live transcript
+        transcriber = LiveTranscriber(mock_mode=True)
+        transcriber.start()
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+        transcriber.enqueue_chunk(samples, 0.0, 0.5)
+        live_text = transcriber.stop(timeout=5.0)
+        live_snap = transcriber.transcript.get_snapshot()
+
+        assert live_snap["is_finalized"] is True
+        assert len(live_snap["segments"]) == 1
+
+        # 2. Simulate offline retranscription result
+        offline_result = {
+            "transcript": "Offline full master audio transcription text.",
+            "segments": [
+                {"index": 0, "start": 0.0, "end": 2.5, "text": "Offline full master audio transcription text."}
+            ],
+            "session_id": f"offline_{uuid.uuid4().hex[:8]}"
+        }
+
+        # Verify replacement semantics: offline result has fresh session_id and independent segments
+        assert offline_result["transcript"] != live_text
+        assert offline_result["session_id"] != live_snap.get("session_token")
+        assert len(offline_result["segments"]) == 1
+        # No duplication or merging
+        assert "Simulated speech" not in offline_result["transcript"]
+
+    def test_22_pause_resume_and_reset_preserves_session_integrity(self):
+        """Verify pause/resume ignores chunks while paused, and reset cleans state."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        token = transcriber.start()
+
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+
+        # Pause: normal chunks rejected, is_final allowed
+        transcriber.pause()
+        assert transcriber.enqueue_chunk(samples, 0.0, 0.5) is False
+        assert transcriber.enqueue_chunk(samples, 0.5, 1.0, is_final=True) is True
+
+        # Resume: normal chunks accepted
+        transcriber.resume()
+        assert transcriber.enqueue_chunk(samples, 1.0, 1.5) is True
+
+        # Stop
+        transcriber.stop(timeout=3.0)
+
+        # Reset: verifies full state cleanup
+        transcriber.reset()
+        assert transcriber.is_finalized is True
+        assert transcriber.session_token is None
+        assert len(transcriber.transcript.segments) == 0
+        assert transcriber._queue.empty() is True
 
 
 

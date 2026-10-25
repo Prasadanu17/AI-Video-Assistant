@@ -16,6 +16,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
@@ -47,10 +48,19 @@ class LiveTranscript:
     dropped_chunks_count: int = 0
     dropped_audio_seconds: float = 0.0
     last_error: Optional[str] = None
+    session_token: Optional[str] = None
+    is_finalized: bool = False
 
-    def add_segment(self, segment: LiveTranscriptSegment) -> None:
+    def add_segment(self, segment: LiveTranscriptSegment, session_token: Optional[str] = None) -> bool:
         with self._lock:
+            # Reject late results if transcript has been finalized
+            if self.is_finalized:
+                return False
+            # Reject results from an old/superseded session
+            if session_token is not None and self.session_token is not None and session_token != self.session_token:
+                return False
             self.segments.append(segment)
+            return True
 
     @property
     def full_text(self) -> str:
@@ -91,6 +101,8 @@ class LiveTranscript:
                 "dropped_audio_seconds": self.dropped_audio_seconds,
                 "real_time_factor": rtf,
                 "last_error": self.last_error,
+                "session_token": self.session_token,
+                "is_finalized": self.is_finalized,
             }
 
     def clear(self) -> None:
@@ -102,6 +114,8 @@ class LiveTranscript:
             self.dropped_chunks_count = 0
             self.dropped_audio_seconds = 0.0
             self.last_error = None
+            self.is_finalized = False
+            self.session_token = None
 
 
 
@@ -259,6 +273,12 @@ class LiveTranscriber:
         self._paused = False
         self._segment_index = 0
 
+        # Session lifecycle & isolation
+        self._session_generation: int = 0
+        self._current_session_token: str = f"sess_0_{uuid.uuid4().hex[:8]}"
+        self._is_finalized: bool = False
+        self.transcript.session_token = self._current_session_token
+
         # Backpressure monitoring
         self._chunks_enqueued = 0
         self._chunks_processed = 0
@@ -270,6 +290,14 @@ class LiveTranscriber:
         return self._worker_thread is not None and self._worker_thread.is_alive()
 
     @property
+    def session_token(self) -> str:
+        return self._current_session_token
+
+    @property
+    def is_finalized(self) -> bool:
+        return self._is_finalized
+
+    @property
     def pending_chunk_count(self) -> int:
         return self._queue.qsize()
 
@@ -277,10 +305,18 @@ class LiveTranscriber:
     def dropped_chunk_count(self) -> int:
         return self._chunks_dropped
 
-    def start(self) -> None:
-        """Start the background transcription worker thread."""
-        if self.is_running:
-            return
+    def start(self) -> str:
+        """Start the background transcription worker thread with a unique session token."""
+        if self.is_running and not self._is_finalized:
+            return self._current_session_token
+
+        self._session_generation += 1
+        session_token = f"sess_{self._session_generation}_{uuid.uuid4().hex[:8]}"
+        self._current_session_token = session_token
+        self._is_finalized = False
+        with self.transcript._lock:
+            self.transcript.session_token = session_token
+            self.transcript.is_finalized = False
 
         self._stop_event.clear()
         self._paused = False
@@ -290,13 +326,15 @@ class LiveTranscriber:
         self._chunks_dropped = 0
         self._dropped_audio_seconds = 0.0
 
-        self._worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="LiveTranscriberWorker",
-            daemon=True,
-        )
-        self._worker_thread.start()
-        print(f"[LiveTranscriber] Started live transcription worker (lang='{self.language}').")
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(
+                target=self._worker_loop,
+                name=f"LiveTranscriberWorker-{self._session_generation}",
+                daemon=True,
+            )
+            self._worker_thread.start()
+        print(f"[LiveTranscriber] Started live transcription worker (session='{session_token}', lang='{self.language}').")
+        return session_token
 
     def pause(self) -> None:
         """Pause live transcription. In-flight chunks finish, but incoming chunks are ignored."""
@@ -322,6 +360,10 @@ class LiveTranscriber:
         if self._paused and not is_final:
             return False
 
+        if self._is_finalized:
+            print(f"[LiveTranscriber] Notice: Rejected chunk for finalized session '{self._current_session_token}'.")
+            return False
+
         if len(pcm_data) == 0:
             return False
 
@@ -330,6 +372,8 @@ class LiveTranscriber:
             "start_time": start_time,
             "end_time": end_time,
             "is_final": is_final,
+            "session_token": self._current_session_token,
+            "session_generation": self._session_generation,
         }
 
         try:
@@ -354,10 +398,11 @@ class LiveTranscriber:
 
     def stop(self, timeout: float = None) -> str:
         """
-        Stop worker, flush all remaining audio chunks in the queue, and return final transcript.
-        Guarantees that pending chunks are drained and processed before finalizing.
+        Stop worker, flush all remaining audio chunks in the queue for the current session,
+        and return final transcript. Guarantees that pending chunks of this session are drained
+        and processed before finalizing. Once finalized, late or stale results are discarded.
         """
-        print("[LiveTranscriber] Stopping live transcriber and flushing remaining queue...")
+        print(f"[LiveTranscriber] Stopping live transcriber (session='{self._current_session_token}')...")
         self._stop_event.set()
 
         # Enqueue sentinel to wake up worker if blocked
@@ -370,11 +415,28 @@ class LiveTranscriber:
         pending = self._queue.qsize()
         effective_timeout = timeout if timeout is not None else max(30.0, pending * 45.0 + 30.0)
 
+        worker_timed_out = False
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=effective_timeout)
+            if self._worker_thread.is_alive():
+                worker_timed_out = True
 
-        # Check if queue successfully drained; record warning if chunks remain
-        if not self._queue.empty():
+        # Seal and finalize the session so any delayed or lingering worker inference
+        # cannot append to this transcript or contaminate subsequent sessions.
+        self._is_finalized = True
+        with self.transcript._lock:
+            self.transcript.is_finalized = True
+
+        if worker_timed_out:
+            rem = self._queue.qsize()
+            warning_msg = (
+                f"Stop timed out after {effective_timeout:.1f}s: worker still active in background "
+                f"({rem} pending chunk(s) un-drained). Session is finalized; late results will be discarded."
+            )
+            print(f"[LiveTranscriber] Warning: {warning_msg}")
+            with self.transcript._lock:
+                self.transcript.last_error = warning_msg
+        elif not self._queue.empty():
             rem = self._queue.qsize()
             warning_msg = f"Stop completed with {rem} pending chunk(s) remaining in queue."
             print(f"[LiveTranscriber] Notice: {warning_msg}")
@@ -387,8 +449,11 @@ class LiveTranscriber:
         return final_text
 
     def reset(self) -> None:
-        """Reset transcriber state and drain any queued items."""
+        """Reset transcriber state, finalize previous session, and drain queued items."""
         self._stop_event.set()
+        self._is_finalized = True
+        self._current_session_token = None
+
         try:
             self._queue.put_nowait(None)
         except Exception:
@@ -421,12 +486,21 @@ class LiveTranscriber:
             try:
                 item = self._queue.get(timeout=0.2)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    break
                 continue
 
             if item is None:
                 # Sentinel encountered
                 self._queue.task_done()
                 break
+
+            # Fast drop if chunk belongs to an already-finalized or superseded session
+            chunk_session = item.get("session_token")
+            if self._is_finalized or (chunk_session is not None and chunk_session != self._current_session_token):
+                print(f"[LiveTranscriber] Notice: Discarding queued chunk from inactive/finalized session '{chunk_session}'.")
+                self._queue.task_done()
+                continue
 
             self.transcript.is_busy = True
             try:
@@ -486,8 +560,13 @@ class LiveTranscriber:
                             pass
             t_inf = time.perf_counter() - t0
 
-        # Record audio duration and inference timing for every processed chunk
+        chunk_session = item.get("session_token")
+
+        # Record audio duration and inference timing only if session is still active
         with self.transcript._lock:
+            if self._is_finalized or (chunk_session is not None and chunk_session != self._current_session_token):
+                print(f"[LiveTranscriber] Notice: Discarding completed inference for inactive/finalized session '{chunk_session}'.")
+                return
             self.transcript.total_audio_seconds += chunk_duration
             self.transcript.total_inference_seconds += t_inf
 
@@ -513,7 +592,10 @@ class LiveTranscriber:
         )
         self._segment_index += 1
 
-        self.transcript.add_segment(segment)
+        added = self.transcript.add_segment(segment, session_token=chunk_session)
+        if not added:
+            print(f"[LiveTranscriber] Notice: Segment rejected by transcript (session mismatch or finalized).")
+            return
 
         if self.on_segment_callback:
             try:
