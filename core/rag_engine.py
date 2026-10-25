@@ -13,6 +13,8 @@ from core.vector_store import (
     COLLECTION_NAME,
 )
 
+FALLBACK_PHRASE = "I could not find this information in the transcript."
+
 RAG_SYSTEM_PROMPT = """You are an intelligent video transcript assistant. Your task is to answer the user's question accurately using ONLY the provided transcript context below.
 
 Guidelines:
@@ -108,36 +110,57 @@ def create_rag_runnable(retriever, llm=None):
 
 def build_rag_chain(
     transcript: str,
+    session_id: str = None,
     k: int = DEFAULT_K,
     collection_name: str = COLLECTION_NAME,
     verbose: bool = False,
 ):
     """
     Build a fresh vector store from the transcript and return an LCEL RAG chain.
-    Ensures clean collection isolation so old transcripts are never mixed.
+    Ensures clean session isolation so transcripts from different videos/sessions
+    are never cross-retrieved.
     """
+    import uuid
+    active_session_id = str(session_id).strip() if session_id else f"sess_{uuid.uuid4().hex[:8]}"
+
     vector_store = build_vector_store(
         transcript=transcript,
+        session_id=active_session_id,
         collection_name=collection_name,
         clear_existing=True,
     )
-    retriever = get_retriever(vector_store, k=k)
+    retriever = get_retriever(vector_store, session_id=active_session_id, k=k)
     llm = get_llm()
 
-    return create_rag_runnable(retriever, llm)
+    rag_chain = create_rag_runnable(retriever, llm)
+    try:
+        object.__setattr__(rag_chain, "session_id", active_session_id)
+        object.__setattr__(rag_chain, "retriever", retriever)
+    except Exception:
+        pass
+
+    return rag_chain
 
 
 def load_rag_chain(
+    session_id: str = None,
     k: int = DEFAULT_K,
     collection_name: str = COLLECTION_NAME,
     verbose: bool = False,
 ):
-    """Load an existing Chroma collection and return an LCEL RAG chain."""
+    """Load an existing Chroma collection and return an LCEL RAG chain filtered by session_id."""
     vector_store = load_vector_store(collection_name=collection_name)
-    retriever = get_retriever(vector_store, k=k)
+    retriever = get_retriever(vector_store, session_id=session_id, k=k)
     llm = get_llm()
 
-    return create_rag_runnable(retriever, llm)
+    rag_chain = create_rag_runnable(retriever, llm)
+    try:
+        object.__setattr__(rag_chain, "session_id", session_id)
+        object.__setattr__(rag_chain, "retriever", retriever)
+    except Exception:
+        pass
+
+    return rag_chain
 
 
 def get_retrieved_chunks(retriever, question: str) -> list:
@@ -153,6 +176,9 @@ def ask_question(rag_chain, question: str, retriever=None, verbose: bool = False
 
     # Diagnostic logging if verbose is requested or DEBUG_RAG environment variable is set
     debug_mode = verbose or os.getenv("DEBUG_RAG", "0") in ("1", "true", "True")
+    if retriever is None and hasattr(rag_chain, "retriever"):
+        retriever = getattr(rag_chain, "retriever", None)
+
     if debug_mode and retriever is not None:
         docs = retriever.invoke(question)
         print(f"[Debug] Retrieved {len(docs)} chunk(s):")

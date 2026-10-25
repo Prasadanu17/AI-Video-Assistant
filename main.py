@@ -15,11 +15,16 @@ if hasattr(sys.stdout, "reconfigure"):
 from utils.audio_processor import process_input
 from core.transcriber import transcribe_all
 from core.summarizer import summarize, generate_title
-from core.extractor import extract_action_items, extract_key_decisions, extract_questions
+from core.extractor import (
+    extract_action_items,
+    extract_key_decisions,
+    extract_questions,
+    extract_all_insights,
+)
 from core.rag_engine import build_rag_chain, ask_question
 
 
-def run_pipeline(source: str, language: str = "english") -> dict:
+def run_pipeline(source: str, language: str = "english", session_id: str = None) -> dict:
     print("\nStarting AI Video Assistant...")
     stage_timings = {}
     t_start = time.perf_counter()
@@ -33,39 +38,29 @@ def run_pipeline(source: str, language: str = "english") -> dict:
     stage_timings["Speech Transcription"] = time.perf_counter() - t0
     print(f"\nRaw transcription (first 300 chars):\n{transcript[:300]}...\n")
 
-    t0 = time.perf_counter()
-    print("Generating title...")
-    title = generate_title(transcript)
-    stage_timings["Title Generation"] = time.perf_counter() - t0
-    time.sleep(1.0)
+    t_llm = time.perf_counter()
+    print("Running parallel LLM analysis (Title, Summary, Actions, Decisions, Questions)...")
+    llm_res = extract_all_insights(
+        transcript,
+        progress_callback=lambda curr, total, name: print(f"  [+] ({curr}/{total}) {name} completed")
+    )
+    stage_timings.update(llm_res["stage_timings"])
+    stage_timings["LLM Analysis (Parallel)"] = time.perf_counter() - t_llm
+
+    title = llm_res["title"]
+    summary = llm_res["summary"]
+    action_items = llm_res["action_items"]
+    decisions = llm_res["key_decisions"]
+    questions = llm_res["open_questions"]
+
+    import uuid
+    if not session_id:
+        source_base = os.path.splitext(os.path.basename(source))[0][:16].replace(" ", "_")
+        session_id = f"{source_base}_{uuid.uuid4().hex[:6]}" if source_base else f"cli_{uuid.uuid4().hex[:8]}"
 
     t0 = time.perf_counter()
-    print("Generating summary...")
-    summary = summarize(transcript)
-    stage_timings["Summary Generation"] = time.perf_counter() - t0
-    time.sleep(1.0)
-
-    t0 = time.perf_counter()
-    print("Extracting action items...")
-    actions_item = extract_action_items(transcript)
-    stage_timings["Action Items"] = time.perf_counter() - t0
-    time.sleep(1.0)
-
-    t0 = time.perf_counter()
-    print("Extracting key decisions...")
-    decisions = extract_key_decisions(transcript)
-    stage_timings["Key Decisions"] = time.perf_counter() - t0
-    time.sleep(1.0)
-
-    t0 = time.perf_counter()
-    print("Extracting open questions...")
-    questions = extract_questions(transcript)
-    stage_timings["Open Questions"] = time.perf_counter() - t0
-    time.sleep(1.0)
-
-    t0 = time.perf_counter()
-    print("Building RAG vector store and chain...")
-    rag_chain = build_rag_chain(transcript)
+    print(f"Building RAG vector store and chain (session: {session_id})...")
+    rag_chain = build_rag_chain(transcript, session_id=session_id)
     stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
 
     total_time = time.perf_counter() - t_start
@@ -82,13 +77,11 @@ def run_pipeline(source: str, language: str = "english") -> dict:
         "transcript": transcript,
         "title": title,
         "summary": summary,
-        "action_items": actions_item,
-        "actions_items": actions_item,
+        "action_items": action_items,
         "key_decisions": decisions,
-        "decisions": decisions,
         "open_questions": questions,
-        "questions": questions,
         "rag_chain": rag_chain,
+        "session_id": session_id,
         "stage_timings": stage_timings,
     }
 

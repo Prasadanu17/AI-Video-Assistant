@@ -24,3 +24,22 @@ downloads/
 # OS
 .DS_Store
 Thumbs.db
+
+# Vector Database (local ChromaDB files)
+vector_db/
+
+# Media & Generated Audio Artifacts
+*.wav
+*.webm
+*.mp3
+*.mp4
+*.mkv
+*.mov
+*.m4a
+*_converted.wav
+*_chunk_*.wav
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/

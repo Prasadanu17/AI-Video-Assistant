@@ -6,8 +6,10 @@ Place this file next to your existing `utils/` and `core/` folders and .env.
 """
 import io
 import os
+import shutil
 import tempfile
 import time
+import uuid
 from contextlib import redirect_stdout
 
 import streamlit as st
@@ -22,6 +24,7 @@ from core.extractor import (
     extract_action_items,
     extract_key_decisions,
     extract_questions,
+    extract_all_insights,
 )
 from core.rag_engine import build_rag_chain, ask_question
 
@@ -145,6 +148,7 @@ st.session_state.setdefault("result", None)
 st.session_state.setdefault("messages", [])
 st.session_state.setdefault("source_label", "")
 st.session_state.setdefault("language", "English transcription")
+st.session_state.setdefault("session_id", "")
 
 # Supported language options matching requirements
 LANGUAGE_OPTIONS = [
@@ -172,8 +176,12 @@ def save_upload(uploaded) -> str:
     return target
 
 
-def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False) -> dict:
+def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False, session_id: str = None) -> dict:
     """Same steps as the CLI pipeline, with live progress in the UI and stage-by-stage timing metrics."""
+    if not session_id:
+        source_base = os.path.splitext(os.path.basename(source))[0][:16].replace(" ", "_")
+        session_id = f"{source_base}_{uuid.uuid4().hex[:6]}" if source_base else f"ui_{uuid.uuid4().hex[:8]}"
+
     mode_info = resolve_language_mode(language)
     is_nepali_translate = (mode_info.get("whisper_code") == "ne" and mode_info.get("task") == "translate")
 
@@ -216,44 +224,31 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
             transcript = str(res)
             original_transcript = None
 
-        st.write("✍️ Writing title...")
-        t0 = time.perf_counter()
-        title = generate_title(transcript)
-        stage_timings["Title Generation"] = time.perf_counter() - t0
-        progress_bar.progress(0.70, text="Writing summary...")
-        time.sleep(CALL_DELAY_SECONDS)
+        st.write("🧠 Generating insights in parallel (Title, Summary, Action Items, Decisions, Questions)...")
+        t_llm = time.perf_counter()
 
-        st.write("📝 Writing summary...")
-        t0 = time.perf_counter()
-        summary = summarize(transcript)
-        stage_timings["Summary Generation"] = time.perf_counter() - t0
-        progress_bar.progress(0.80, text="Finding action items...")
-        time.sleep(CALL_DELAY_SECONDS)
+        def on_llm_progress(curr, total, name):
+            pct = 0.65 + 0.30 * (curr / max(1, total))
+            progress_bar.progress(min(pct, 0.95), text=f"Analyzing transcript: {name} completed ({curr}/{total})...")
+            st.write(f"  • {name} completed")
 
-        st.write("📋 Finding action items...")
-        t0 = time.perf_counter()
-        action_items = extract_action_items(transcript)
-        stage_timings["Action Items"] = time.perf_counter() - t0
-        progress_bar.progress(0.85, text="Finding key decisions...")
-        time.sleep(CALL_DELAY_SECONDS)
+        llm_res = extract_all_insights(
+            transcript,
+            progress_callback=on_llm_progress,
+        )
+        stage_timings.update(llm_res["stage_timings"])
+        stage_timings["LLM Analysis (Parallel)"] = time.perf_counter() - t_llm
 
-        st.write("💡 Finding key decisions...")
-        t0 = time.perf_counter()
-        decisions = extract_key_decisions(transcript)
-        stage_timings["Key Decisions"] = time.perf_counter() - t0
-        progress_bar.progress(0.90, text="Finding open questions...")
-        time.sleep(CALL_DELAY_SECONDS)
+        title = llm_res["title"]
+        summary = llm_res["summary"]
+        action_items = llm_res["action_items"]
+        decisions = llm_res["key_decisions"]
+        questions = llm_res["open_questions"]
 
-        st.write("❓ Finding open questions...")
+        st.write(f"🔍 Indexing transcript for chat (session: {session_id})...")
+        progress_bar.progress(0.95, text=f"Indexing transcript into ChromaDB ({session_id})...")
         t0 = time.perf_counter()
-        questions = extract_questions(transcript)
-        stage_timings["Open Questions"] = time.perf_counter() - t0
-        progress_bar.progress(0.95, text="Indexing transcript into ChromaDB...")
-        time.sleep(CALL_DELAY_SECONDS)
-
-        st.write("🔍 Indexing transcript for chat...")
-        t0 = time.perf_counter()
-        rag_chain = build_rag_chain(transcript)
+        rag_chain = build_rag_chain(transcript, session_id=session_id)
         stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
 
         t_total = time.perf_counter() - t_pipeline_start
@@ -271,6 +266,7 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
         "key_decisions": decisions,
         "open_questions": questions,
         "rag_chain": rag_chain,
+        "session_id": session_id,
         "display_language": mode_info["display_name"],
         "is_translated": is_nepali_translate,
         "stage_timings": stage_timings,
@@ -371,6 +367,7 @@ with st.sidebar:
         if st.button("Start over", use_container_width=True):
             st.session_state.result = None
             st.session_state.messages = []
+            st.session_state.session_id = ""
             st.rerun()
 
 # --------------------------------------------------------------------------
@@ -378,7 +375,14 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 if analyze and source is not None:
     st.session_state.messages = []
-    path = save_upload(source) if input_mode == "Upload a file" else source
+    is_uploaded_file = (input_mode == "Upload a file")
+    temp_dir = None
+    if is_uploaded_file:
+        path = save_upload(source)
+        temp_dir = os.path.dirname(path)
+    else:
+        path = source
+
     try:
         st.session_state.result = run_pipeline_ui(
             path,
@@ -387,12 +391,20 @@ if analyze and source is not None:
         )
         st.session_state.source_label = source_label
         st.session_state.language = language
+        st.session_state.session_id = st.session_state.result.get("session_id", "")
     except Exception as e:
         st.session_state.result = None
         st.error(
             f"Something went wrong while processing the video.\n\n`{e}`\n\n"
             "Check the link or file, and make sure your API keys are set in .env."
         )
+    finally:
+        # Reliable cleanup: remove temporary upload directory and generated audio artifacts
+        if is_uploaded_file and temp_dir and os.path.isdir(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 result = st.session_state.result
 
