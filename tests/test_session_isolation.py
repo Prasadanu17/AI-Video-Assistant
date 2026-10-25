@@ -107,7 +107,7 @@ def test_02_overlapping_similar_terms_and_no_cross_retrieval():
 
 def test_03_empty_or_missing_session_id():
     """Verify system handles empty, None, or whitespace-only session IDs safely."""
-    # 1. build_vector_store with None session_id generates a fallback session without error
+    # 1. build_vector_store with None session_id generates a fallback session and binds it to context
     vs = build_vector_store(
         transcript="Test content with missing session identifier fallback handling.",
         collection_name=TEST_COLLECTION,
@@ -115,15 +115,21 @@ def test_03_empty_or_missing_session_id():
         clear_existing=False,
     )
     assert vs is not None
+    assert hasattr(vs, "session_id")
+    assert getattr(vs, "session_id") is not None
 
-    # 2. get_retriever with None or empty session_id does not crash
+    # 2. get_retriever with None automatically resolves active context session ID
     retriever_none = get_retriever(vs, session_id=None, k=2)
     docs_none = retriever_none.invoke("Test content")
     assert isinstance(docs_none, list)
+    assert len(docs_none) > 0
+    assert docs_none[0].metadata.get("session_id") == getattr(vs, "session_id")
 
+    # 3. get_retriever with empty string strictly returns 0 chunks (no unfiltered fallback)
     retriever_empty = get_retriever(vs, session_id="", k=2)
     docs_empty = retriever_empty.invoke("Test content")
     assert isinstance(docs_empty, list)
+    assert len(docs_empty) == 0, "Empty session ID must return 0 results, never unfiltered chunks"
 
 
 def test_04_repeated_processing_stale_index_handling():
@@ -215,3 +221,41 @@ def test_06_rag_fallback_preservation():
     assert FALLBACK_PHRASE.lower() in answer.lower(), (
         f"Expected fallback phrase '{FALLBACK_PHRASE}', but got: {answer}"
     )
+
+
+def test_07_missing_or_invalid_session_never_exposes_chunks():
+    """
+    Regression test: verify that missing, whitespace, or invalid session IDs
+    can NEVER expose another session's indexed chunks.
+    """
+    secret_session = f"confidential_{uuid.uuid4().hex[:6]}"
+    secret_text = "Executive confidential: merger discussion between Company Alpha and Beta."
+
+    vs = build_vector_store(
+        transcript=secret_text,
+        collection_name=TEST_COLLECTION,
+        session_id=secret_session,
+        clear_existing=True,
+    )
+
+    # 1. Querying with invalid session ID returns 0 chunks (cannot leak secret_session)
+    retriever_invalid = get_retriever(vs, session_id="completely_bogus_session_id", k=5)
+    docs_invalid = retriever_invalid.invoke("merger discussion")
+    assert len(docs_invalid) == 0
+
+    # 2. Querying with whitespace session ID returns 0 chunks
+    retriever_spaces = get_retriever(vs, session_id="   ", k=5)
+    docs_spaces = retriever_spaces.invoke("merger discussion")
+    assert len(docs_spaces) == 0
+
+    # 3. Requesting strict error on missing session_id raises ValueError
+    with pytest.raises(ValueError, match="valid session_id is required"):
+        get_retriever(vs, session_id="", raise_on_missing=True)
+
+    # 4. load_rag_chain with missing session_id raises ValueError
+    from core.rag_engine import load_rag_chain
+    with pytest.raises(ValueError, match="valid session_id is required"):
+        load_rag_chain(session_id="", collection_name=TEST_COLLECTION)
+
+    with pytest.raises(ValueError, match="valid session_id is required"):
+        load_rag_chain(session_id=None, collection_name=TEST_COLLECTION)

@@ -9,6 +9,8 @@ streamlit>=1.36.0
 yt-dlp[default]>=2026.8.19  # YouTube downloads with EJS support for JS challenges
 pydub>=0.25.1              # Audio format conversion / chunking
 ffmpeg-python>=0.2.0       # Wrapper around ffmpeg (ffmpeg binary must be installed separately)
+sounddevice>=0.5.0         # Pure Python audio device recording
+pyaudiowpatch>=0.2.12.9    # Windows WASAPI loopback system audio recording
 
 # ------------------------------
 # Transcription (local Whisper)

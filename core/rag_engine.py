@@ -143,19 +143,26 @@ def build_rag_chain(
 
 
 def load_rag_chain(
-    session_id: str = None,
+    session_id: str,
     k: int = DEFAULT_K,
     collection_name: str = COLLECTION_NAME,
     verbose: bool = False,
 ):
     """Load an existing Chroma collection and return an LCEL RAG chain filtered by session_id."""
+    clean_session_id = str(session_id).strip() if session_id else None
+    if not clean_session_id:
+        raise ValueError(
+            "A valid session_id is required to load a RAG chain. "
+            "Loading without a session_id is prohibited to prevent cross-video data leakage."
+        )
+
     vector_store = load_vector_store(collection_name=collection_name)
-    retriever = get_retriever(vector_store, session_id=session_id, k=k)
+    retriever = get_retriever(vector_store, session_id=clean_session_id, k=k, raise_on_missing=True)
     llm = get_llm()
 
     rag_chain = create_rag_runnable(retriever, llm)
     try:
-        object.__setattr__(rag_chain, "session_id", session_id)
+        object.__setattr__(rag_chain, "session_id", clean_session_id)
         object.__setattr__(rag_chain, "retriever", retriever)
     except Exception:
         pass

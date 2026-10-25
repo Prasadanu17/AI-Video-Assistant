@@ -27,6 +27,12 @@ from core.extractor import (
     extract_all_insights,
 )
 from core.rag_engine import build_rag_chain, ask_question
+from core.audio_recorder import (
+    AudioRecorder,
+    AudioSource,
+    RecordingState,
+    query_available_devices,
+)
 
 # --------------------------------------------------------------------------
 # Page setup
@@ -149,6 +155,10 @@ st.session_state.setdefault("messages", [])
 st.session_state.setdefault("source_label", "")
 st.session_state.setdefault("language", "English transcription")
 st.session_state.setdefault("session_id", "")
+st.session_state.setdefault("recorder", None)
+st.session_state.setdefault("recorded_audio_path", None)
+if st.session_state.recorder is None:
+    st.session_state.recorder = AudioRecorder()
 
 # Supported language options matching requirements
 LANGUAGE_OPTIONS = [
@@ -323,7 +333,9 @@ with st.sidebar:
     )
 
     input_mode = st.radio(
-        "Video source", ["YouTube link", "Upload a file"], label_visibility="collapsed"
+        "Video source",
+        ["YouTube link", "Upload a file", "Live recording"],
+        label_visibility="collapsed",
     )
 
     source, source_label = None, ""
@@ -331,7 +343,7 @@ with st.sidebar:
         url = st.text_input("YouTube URL", placeholder="https://youtube.com/watch?v=...")
         if url.strip():
             source, source_label = url.strip(), url.strip()
-    else:
+    elif input_mode == "Upload a file":
         uploaded = st.file_uploader(
             "Video or audio file",
             type=["mp4", "mkv", "mov", "avi", "webm", "mp3", "wav", "m4a"],
@@ -339,6 +351,76 @@ with st.sidebar:
         if uploaded:
             source_label = uploaded.name
             source = uploaded  # saved to disk only when the user clicks Analyze
+    else:
+        # Live audio recording controls (Microphone + System Loopback)
+        rec = st.session_state.recorder
+        rec_state = rec.state
+        elapsed = rec.get_elapsed_seconds()
+
+        audio_mode_choice = st.selectbox(
+            "Audio capture source",
+            ["Microphone + Meeting Audio", "Microphone only", "Meeting Audio only (System Loopback)"],
+            index=0,
+            disabled=(rec_state in (RecordingState.RECORDING, RecordingState.PAUSED)),
+            help="Captures your microphone voice and Windows WASAPI system meeting audio simultaneously.",
+        )
+        source_map = {
+            "Microphone + Meeting Audio": AudioSource.BOTH,
+            "Microphone only": AudioSource.MICROPHONE,
+            "Meeting Audio only (System Loopback)": AudioSource.SYSTEM,
+        }
+        chosen_source = source_map[audio_mode_choice]
+
+        if rec_state == RecordingState.IDLE:
+            st.info("⚪ Ready to record. Click **Start recording** to begin capturing.")
+        elif rec_state == RecordingState.RECORDING:
+            st.error(f"🔴 **Recording in progress...** ({elapsed:.1f}s)")
+        elif rec_state == RecordingState.PAUSED:
+            st.warning(f"⏸️ **Recording paused** ({elapsed:.1f}s)")
+        elif rec_state == RecordingState.STOPPED:
+            st.success(f"⏹️ **Recording finished** ({elapsed:.1f}s)")
+
+        col_r1, col_r2 = st.columns(2)
+        if rec_state == RecordingState.IDLE:
+            if col_r1.button("Start recording", type="primary", use_container_width=True):
+                try:
+                    rec.start(source=chosen_source)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to start recording: {e}")
+        elif rec_state == RecordingState.RECORDING:
+            if col_r1.button("Pause", use_container_width=True):
+                rec.pause()
+                st.rerun()
+            if col_r2.button("Stop", type="primary", use_container_width=True):
+                try:
+                    wav_file = rec.stop()
+                    st.session_state.recorded_audio_path = wav_file
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to stop recording: {e}")
+        elif rec_state == RecordingState.PAUSED:
+            if col_r1.button("Resume", type="primary", use_container_width=True):
+                rec.resume()
+                st.rerun()
+            if col_r2.button("Stop", use_container_width=True):
+                try:
+                    wav_file = rec.stop()
+                    st.session_state.recorded_audio_path = wav_file
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to stop recording: {e}")
+        elif rec_state == RecordingState.STOPPED:
+            if col_r1.button("New recording", use_container_width=True):
+                rec.reset()
+                st.session_state.recorded_audio_path = None
+                st.rerun()
+
+        if st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
+            st.caption("🎧 Recording preview:")
+            st.audio(st.session_state.recorded_audio_path)
+            source = st.session_state.recorded_audio_path
+            source_label = f"Live Recording ({rec.source.value})"
 
     default_idx = 0
     if st.session_state.language in LANGUAGE_OPTIONS:
@@ -368,6 +450,14 @@ with st.sidebar:
             st.session_state.result = None
             st.session_state.messages = []
             st.session_state.session_id = ""
+            if st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
+                try:
+                    os.remove(st.session_state.recorded_audio_path)
+                except Exception:
+                    pass
+            st.session_state.recorded_audio_path = None
+            if st.session_state.recorder:
+                st.session_state.recorder.reset()
             st.rerun()
 
 # --------------------------------------------------------------------------
