@@ -3,6 +3,7 @@ import threading
 import requests
 from pydub import AudioSegment
 import whisper
+import numpy as np
 
 # Sarvam's sync STT-translate API rejects audio longer than 30s.
 # We slice each chunk into 25s pieces (with a 5s safety margin) before sending.
@@ -223,7 +224,7 @@ def load_model():
 
 
 def transcribe_chunk_whisper(
-    chunk_path: str,
+    chunk_path: str | np.ndarray,
     language: str = None,
     task: str = "transcribe",
     return_segments: bool = False,
@@ -232,18 +233,23 @@ def transcribe_chunk_whisper(
     Transcribe or translate an audio chunk using faster-whisper or fallback Whisper.
     
     Args:
-        chunk_path: Path to the WAV audio chunk.
+        chunk_path: Path to the WAV audio chunk, or 1D float32 NumPy audio array.
         language: Whisper language code ('en', 'hi', 'ne', or None for auto-detect).
         task: 'transcribe' (default) or 'translate' (translates to English).
         return_segments: Whether to return full segments with timestamps.
     """
-    if not os.path.exists(chunk_path):
-        raise FileNotFoundError(f"Audio chunk file not found: {chunk_path}")
-
-    # Check for empty / zero-byte chunk
-    if os.path.getsize(chunk_path) == 0:
-        print(f"[!] Warning: Audio chunk {chunk_path} is 0 bytes. Skipping.")
-        return {"text": "", "segments": []} if return_segments else ""
+    if isinstance(chunk_path, np.ndarray):
+        if chunk_path.size == 0:
+            print("[!] Warning: Audio chunk numpy array is empty. Skipping.")
+            return {"text": "", "segments": []} if return_segments else ""
+    elif isinstance(chunk_path, str):
+        if not os.path.exists(chunk_path):
+            raise FileNotFoundError(f"Audio chunk file not found: {chunk_path}")
+        if os.path.getsize(chunk_path) == 0:
+            print(f"[!] Warning: Audio chunk {chunk_path} is 0 bytes. Skipping.")
+            return {"text": "", "segments": []} if return_segments else ""
+    else:
+        raise TypeError(f"chunk_path must be a file path string or numpy array, got {type(chunk_path)}")
 
     model = load_model()
     validate_whisper_model(model, language=language, task=task)
@@ -252,12 +258,27 @@ def transcribe_chunk_whisper(
     if language is not None:
         transcribe_kwargs["language"] = language
 
-    # Configure beam size for faster-whisper (default 1 for fast greedy decoding)
+    # Configure beam size and robust decoding parameters for faster-whisper
     if type(model).__name__ == "WhisperModel":
-        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
+        transcribe_kwargs["condition_on_previous_text"] = False
+        use_vad = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() in ("1", "true", "yes")
+        if use_vad:
+            transcribe_kwargs["vad_filter"] = True
+            transcribe_kwargs["vad_parameters"] = dict(min_silence_duration_ms=400)
 
     try:
-        raw_result = model.transcribe(chunk_path, **transcribe_kwargs)
+        try:
+            raw_result = model.transcribe(chunk_path, **transcribe_kwargs)
+        except Exception as vad_err:
+            if transcribe_kwargs.get("vad_filter"):
+                print(f"[!] VAD notice: {vad_err}. Retrying chunk without VAD...")
+                transcribe_kwargs.pop("vad_filter", None)
+                transcribe_kwargs.pop("vad_parameters", None)
+                raw_result = model.transcribe(chunk_path, **transcribe_kwargs)
+            else:
+                raise
+
 
         # 1. Faster-whisper output format: (segments_generator, info)
         if isinstance(raw_result, tuple) and len(raw_result) == 2:
@@ -358,7 +379,7 @@ def transcribe_chunk_sarvam(chunk_path: str) -> str:
 
 
 def transcribe_chunk(
-    chunk_path: str,
+    chunk_path: str | np.ndarray,
     language: str = "english",
     task: str = None,
     return_segments: bool = False,
@@ -368,6 +389,8 @@ def transcribe_chunk(
     """
     cfg = resolve_language_mode(language=language, task=task)
     if cfg["engine"] == "sarvam":
+        if isinstance(chunk_path, np.ndarray):
+            raise NotImplementedError("Sarvam API requires WAV file path, not in-memory numpy array.")
         text = transcribe_chunk_sarvam(chunk_path)
         return {"text": text, "segments": []} if return_segments else text
 

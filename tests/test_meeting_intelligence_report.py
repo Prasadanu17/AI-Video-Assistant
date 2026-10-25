@@ -439,3 +439,41 @@ class TestBackwardCompatibilityAndIntegration(unittest.TestCase):
                 session_id="live_sess_test_99",
                 segments=live_segments,
             )
+
+    def test_14_live_recording_language_resolution_and_initialization(self):
+        """Regression test: verify language is defined and accepted when starting live recording."""
+        from app import LANGUAGE_OPTIONS
+        from core.live_transcriber import LiveTranscriber
+        from core.transcriber import resolve_language_mode
+
+        # Verify all supported language options can initialize LiveTranscriber without NameError
+        for lang_opt in LANGUAGE_OPTIONS:
+            transcriber = LiveTranscriber(language=lang_opt)
+            self.assertEqual(transcriber.language, lang_opt)
+            mode_info = resolve_language_mode(transcriber.language)
+            self.assertIn("whisper_code", mode_info)
+            self.assertIn("display_name", mode_info)
+
+    def test_15_live_transcript_snapshot_and_recorder_elapsed_compatibility(self):
+        """Regression test: verify LiveTranscript snapshot keys and AudioRecorder elapsed time compatibility."""
+        from core.live_transcriber import LiveTranscript, LiveTranscriptSegment
+        from core.audio_recorder import AudioRecorder
+
+        transcript = LiveTranscript()
+        transcript.add_segment(LiveTranscriptSegment(index=1, start=0.0, end=4.5, text="Snapshot compatibility test", language="en"))
+        snapshot = transcript.get_snapshot()
+
+        # Both 'full_text' and 'text' must exist to prevent KeyError in UI handoffs
+        self.assertIn("full_text", snapshot)
+        self.assertIn("text", snapshot)
+        self.assertEqual(snapshot["full_text"], snapshot["text"])
+        self.assertEqual(snapshot["text"], "Snapshot compatibility test")
+
+        # AudioRecorder must support both get_elapsed_seconds() and get_elapsed_time()
+        rec = AudioRecorder(mock_mode=True)
+        self.assertEqual(rec.get_elapsed_seconds(), 0.0)
+        self.assertEqual(rec.get_elapsed_time(), 0.0)
+        self.assertEqual(rec.get_elapsed_seconds(), rec.get_elapsed_time())
+
+
+

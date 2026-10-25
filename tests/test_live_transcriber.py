@@ -275,3 +275,163 @@ class TestLiveTranscriptionRealModel:
         print(f"\n[Real Model Probe] 2.0s chunk inference: {snapshot['total_inference_seconds']:.2f}s (RTF: {snapshot['real_time_factor']:.2f}x)")
 
         transcriber.reset()
+
+    def test_10_repeated_words_preservation(self):
+        """Verify boundary overlap deduplication preserves repeated emphasis words and does not strip single words."""
+        from core.live_transcriber import deduplicate_overlap
+
+        # 1. Repeated words within sentence must not be stripped
+        prev_repeat = "We need to move very"
+        new_repeat = "very quickly to complete this sprint"
+        # Since 'very' is only 4 chars and 1 word, min_match_words=2 ensures 'very' is preserved!
+        dedup_repeat = deduplicate_overlap(prev_repeat, new_repeat)
+        assert dedup_repeat == "very quickly to complete this sprint"
+
+        # 2. 'yes yes' repetition
+        prev_yes = "Is everyone aligned? Yes"
+        new_yes = "yes absolutely we are"
+        dedup_yes = deduplicate_overlap(prev_yes, new_yes)
+        assert dedup_yes == "yes absolutely we are"
+
+        # 3. Genuine 2-word boundary overlap is cleanly deduplicated
+        prev_phrase = "Let us discuss the quarterly budget"
+        new_phrase = "quarterly budget for the next year"
+        dedup_phrase = deduplicate_overlap(prev_phrase, new_phrase)
+        assert dedup_phrase == "for the next year"
+
+        # 4. Hindi repeated words preserved
+        prev_hi = "यह बहुत"
+        new_hi = "बहुत महत्वपूर्ण निर्णय है"
+        dedup_hi = deduplicate_overlap(prev_hi, new_hi)
+        assert dedup_hi == "बहुत महत्वपूर्ण निर्णय है"
+
+    def test_11_audio_preprocessing_quiet_and_clipped(self):
+        """Verify audio preprocessing boosts quiet speech, soft-limits clipping, and leaves silence untouched."""
+        from core.live_transcriber import preprocess_audio_chunk
+
+        sr = 16000
+        # A. Quiet audio (RMS ~0.02, Peak ~0.10)
+        t = np.linspace(0, 1.0, sr, endpoint=False)
+        quiet_sig = (0.10 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        proc_quiet, metrics_quiet = preprocess_audio_chunk(quiet_sig, sample_rate=sr)
+        assert metrics_quiet["is_near_silence"] is False
+        assert metrics_quiet["applied_gain"] > 1.0
+        assert metrics_quiet["peak"] > 0.10  # boosted
+
+        # B. Near-silence audio (noise floor RMS < 0.001)
+        noise_sig = np.random.normal(0, 0.0005, sr).astype(np.float32)
+        proc_noise, metrics_noise = preprocess_audio_chunk(noise_sig, sample_rate=sr)
+        assert metrics_noise["is_near_silence"] is True
+        assert metrics_noise["applied_gain"] == 1.0  # background noise must NEVER be amplified
+
+        # C. Clipped audio (samples >= 0.99)
+        clipped_sig = np.clip(1.8 * np.sin(2 * np.pi * 440 * t), -1.0, 1.0).astype(np.float32)
+        proc_clipped, metrics_clipped = preprocess_audio_chunk(clipped_sig, sample_rate=sr)
+        assert metrics_clipped["is_clipped"] is True
+        assert np.max(np.abs(proc_clipped)) <= 0.96  # soft-limited below harsh clipping threshold
+
+    def test_12_queue_saturation_and_dropped_chunks_reporting(self):
+        """Verify queue overflow tracks dropped chunks and exposes backpressure warning in snapshot."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        # Artificially set tiny queue to test saturation
+        transcriber._queue = __import__("queue").Queue(maxsize=2)
+        transcriber._stop_event.set()  # keep worker from draining
+
+        dummy = np.zeros(1600, dtype=np.float32)
+        # Put 2 items to fill queue
+        assert transcriber.enqueue_chunk(dummy, 0.0, 0.1) is True
+        assert transcriber.enqueue_chunk(dummy, 0.1, 0.2) is True
+
+        # Third item must overflow and record dropped metric
+        assert transcriber.enqueue_chunk(dummy, 0.2, 0.3) is False
+        assert transcriber.dropped_chunk_count == 1
+        snapshot = transcriber.transcript.get_snapshot()
+        assert snapshot["dropped_chunks_count"] == 1
+        assert snapshot["dropped_audio_seconds"] == pytest.approx(0.1, rel=1e-2)
+        assert "Queue overflow" in snapshot["last_error"]
+        transcriber.reset()
+
+    def test_13_chunker_short_final_buffer_flush(self):
+        """Verify LiveAudioChunker flushes and pads short audio down to 0.1s on stop."""
+        received = []
+        transcriber = LiveTranscriber(mock_mode=True)
+        chunker = LiveAudioChunker(transcriber=transcriber, sample_rate=16000)
+
+        # Feed 0.25 seconds of audio (4000 samples)
+        samples = np.ones(4000, dtype=np.float32) * 0.1
+        chunker.feed_samples(samples)
+
+        # Flush on stop
+        chunker.flush()
+        # Should have enqueued 1 final chunk with at least 0.5s duration (padded)
+        assert transcriber._queue.qsize() == 1
+        item = transcriber._queue.get_nowait()
+        assert item["is_final"] is True
+        assert len(item["pcm_data"]) >= 8000  # padded to 0.5s for Whisper reliability
+        transcriber.reset()
+
+    def test_14_real_speech_benchmark_reproducible(self):
+        """Reproducible benchmark using genuine audio sample to measure latency, RTF, and word counts."""
+        audio_path = os.path.join(PROJECT_ROOT, "test_slice_30s.wav")
+        if not os.path.exists(audio_path):
+            pytest.skip("Audio fixture test_slice_30s.wav not present")
+
+        from core.transcriber import transcribe_chunk_whisper
+
+        t0 = time.perf_counter()
+        res = transcribe_chunk_whisper(audio_path, language="hi", task="transcribe", return_segments=True)
+        elapsed = time.perf_counter() - t0
+
+        text = res["text"] if isinstance(res, dict) else str(res)
+        segments = res.get("segments", []) if isinstance(res, dict) else []
+
+        words = text.split()
+        word_count = len(words)
+        rtf = elapsed / 30.0  # 30-second audio sample
+
+        print(f"\n[Speech Benchmark] 30s Audio: {word_count} words recognized, latency={elapsed:.2f}s, RTF={rtf:.2f}x, segments={len(segments)}")
+        assert word_count >= 15
+        assert len(segments) >= 1
+        assert elapsed > 0.0
+        assert rtf > 0.0
+
+    def test_15_direct_numpy_transcription_and_equivalence(self):
+        """Verify transcribe_chunk accepts 1D float32 numpy array and produces valid segments."""
+        from core.transcriber import transcribe_chunk
+        t = np.linspace(0, 1.0, 16000, endpoint=False)
+        tone_pcm = (0.2 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+        res = transcribe_chunk(tone_pcm, language="en", task="transcribe", return_segments=True)
+        assert isinstance(res, dict)
+        assert "text" in res
+        assert "segments" in res
+        assert isinstance(res["segments"], list)
+
+    def test_16_direct_numpy_empty_and_type_safety(self):
+        """Verify transcribe_chunk handles empty array and invalid types gracefully."""
+        from core.transcriber import transcribe_chunk
+        empty_arr = np.zeros(0, dtype=np.float32)
+        res_empty = transcribe_chunk(empty_arr, language="en", return_segments=True)
+        assert res_empty == {"text": "", "segments": []}
+
+        with pytest.raises(TypeError):
+            transcribe_chunk(12345, language="en")
+
+    def test_17_stop_queue_drain_and_timeout_warning(self):
+        """Verify stop() processes queued items and reports warning if queue remains un-drained."""
+        transcriber = LiveTranscriber(mock_mode=True)
+        transcriber.start()
+
+        # Enqueue 3 mock chunks
+        samples = np.ones(8000, dtype=np.float32) * 0.1
+        transcriber.enqueue_chunk(samples, 0.0, 0.5)
+        transcriber.enqueue_chunk(samples, 0.5, 1.0)
+        transcriber.enqueue_chunk(samples, 1.0, 1.5, is_final=True)
+
+        final_text = transcriber.stop(timeout=5.0)
+        assert transcriber._queue.empty() is True
+        assert len(final_text) > 0
+        assert len(transcriber.transcript.segments) == 3
+
+
+

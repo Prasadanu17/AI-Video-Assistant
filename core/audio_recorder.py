@@ -162,6 +162,8 @@ class AudioRecorder:
 
         # Optional live audio chunker for real-time transcription
         self._live_chunker = None
+        self._live_mic_fifo: List[float] = []
+        self._live_lb_fifo: List[float] = []
 
     def attach_live_chunker(self, chunker) -> None:
         """Attach a LiveAudioChunker to receive live 16kHz audio frames in real time."""
@@ -191,6 +193,9 @@ class AudioRecorder:
                 return self._paused_accumulated_time  # stored total duration at stop
 
         return 0.0
+
+    # Backward-compatible alias for callers expecting get_elapsed_time
+    get_elapsed_time = get_elapsed_seconds
 
     def get_peak_levels(self) -> Tuple[float, float]:
         """Return the latest normalized peak levels (0.0 - 1.0) for (microphone, system)."""
@@ -302,6 +307,8 @@ class AudioRecorder:
             self._output_wav_path = None
             self._mic_frames = []
             self._loopback_frames = []
+            self._live_mic_fifo.clear()
+            self._live_lb_fifo.clear()
             if self._live_chunker:
                 try:
                     self._live_chunker.reset()
@@ -313,6 +320,39 @@ class AudioRecorder:
     # ----------------------------------------------------------------------
     # Hardware Recording Implementation (pyaudiowpatch)
     # ----------------------------------------------------------------------
+    def _feed_dual_to_chunker(self, samples: np.ndarray, is_mic: bool) -> None:
+        """
+        Synchronously blend live microphone and system loopback samples into 16kHz mono
+        for real-time transcription without time distortion.
+        """
+        if not self._live_chunker:
+            return
+        if is_mic:
+            self._live_mic_fifo.extend(samples.tolist())
+        else:
+            self._live_lb_fifo.extend(samples.tolist())
+
+        # If both streams have samples, mix matching blocks (100ms blocks = 1600 samples)
+        min_len = min(len(self._live_mic_fifo), len(self._live_lb_fifo))
+        if min_len >= 1600:
+            mic_block = np.array(self._live_mic_fifo[:min_len], dtype=np.float32)
+            lb_block = np.array(self._live_lb_fifo[:min_len], dtype=np.float32)
+            self._live_mic_fifo = self._live_mic_fifo[min_len:]
+            self._live_lb_fifo = self._live_lb_fifo[min_len:]
+
+            mixed = 0.5 * mic_block + 0.5 * lb_block
+            self._live_chunker.feed_samples(mixed, is_paused=False)
+        elif len(self._live_mic_fifo) > 16000 and len(self._live_lb_fifo) == 0:
+            # Loopback is silent/inactive: advance mic audio so live transcription does not stall
+            mic_block = np.array(self._live_mic_fifo[:8000], dtype=np.float32)
+            self._live_mic_fifo = self._live_mic_fifo[8000:]
+            self._live_chunker.feed_samples(mic_block, is_paused=False)
+        elif len(self._live_lb_fifo) > 16000 and len(self._live_mic_fifo) == 0:
+            # Mic is silent/inactive: advance loopback audio
+            lb_block = np.array(self._live_lb_fifo[:8000], dtype=np.float32)
+            self._live_lb_fifo = self._live_lb_fifo[8000:]
+            self._live_chunker.feed_samples(lb_block, is_paused=False)
+
     def _start_hardware_recording(
         self,
         source: AudioSource,
@@ -342,7 +382,10 @@ class AudioRecorder:
                                     arr = arr.reshape(-1, self._mic_channels).mean(axis=1)
                                 if self._mic_sample_rate != self.target_sample_rate:
                                     arr = self._resample_to_target(arr, self._mic_sample_rate)
-                                self._live_chunker.feed_samples(arr, is_paused=False)
+                                if self._source == AudioSource.MICROPHONE:
+                                    self._live_chunker.feed_samples(arr, is_paused=False)
+                                else:
+                                    self._feed_dual_to_chunker(arr, is_mic=True)
                             except Exception:
                                 pass
                 return (None, pyaudio.paContinue)
@@ -376,14 +419,17 @@ class AudioRecorder:
                     if self._state == RecordingState.RECORDING:
                         self._loopback_frames.append(in_data)
                         self._update_meter(in_data, is_mic=False)
-                        if self._live_chunker and self._source == AudioSource.SYSTEM:
+                        if self._live_chunker:
                             try:
                                 arr = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
                                 if self._lb_channels > 1:
                                     arr = arr.reshape(-1, self._lb_channels).mean(axis=1)
                                 if self._lb_sample_rate != self.target_sample_rate:
                                     arr = self._resample_to_target(arr, self._lb_sample_rate)
-                                self._live_chunker.feed_samples(arr, is_paused=False)
+                                if self._source == AudioSource.SYSTEM:
+                                    self._live_chunker.feed_samples(arr, is_paused=False)
+                                else:
+                                    self._feed_dual_to_chunker(arr, is_mic=False)
                             except Exception:
                                 pass
                 return (None, pyaudio.paContinue)
@@ -405,6 +451,7 @@ class AudioRecorder:
                     f"Could not open system loopback device '{lb_info['name']}': {e}. "
                     "Ensure Windows WASAPI audio is enabled and speakers are connected."
                 )
+
 
     def _resolve_mic_device(self, mic_index: Optional[int]) -> dict:
         if mic_index is not None:
@@ -609,13 +656,16 @@ class AudioRecorder:
         padded_a[:len_a] = stream_a
         padded_b[:len_b] = stream_b
 
-        # 0.5 headroom scaling on each channel to guarantee the mix never hard-clips
         mixed = 0.5 * padded_a + 0.5 * padded_b
 
-        # Peak normalization if signals are loud
-        peak = np.max(np.abs(mixed))
+        # Peak normalization if signals are loud; dynamic gain if quiet
+        peak = np.max(np.abs(mixed)) if max_len > 0 else 0.0
         if peak > 30000.0:
             mixed = (mixed / peak) * 30000.0
+        elif peak > 500.0 and peak < 16000.0:
+            # Safe dynamic boost for quiet speech (up to +6dB / 2.0x gain)
+            boost = min(22000.0 / peak, 2.0)
+            mixed = mixed * boost
 
         return mixed
 

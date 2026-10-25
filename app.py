@@ -343,6 +343,8 @@ def process_live_intelligence_ui(
     audio_source: str = "Live Recording",
     duration_seconds: float = 0.0,
     session_id: str = None,
+    dropped_chunks_count: int = 0,
+    dropped_audio_seconds: float = 0.0,
 ) -> dict:
     """Generate meeting intelligence directly from finalized live transcript segments."""
     if not session_id:
@@ -419,6 +421,8 @@ def process_live_intelligence_ui(
         "is_translated": False,
         "stage_timings": stage_timings,
         "duration_seconds": duration_seconds,
+        "dropped_chunks_count": dropped_chunks_count,
+        "dropped_audio_seconds": dropped_audio_seconds,
         "pdf_bytes": pdf_bytes,
     }
 
@@ -477,6 +481,25 @@ with st.sidebar:
         ["YouTube link", "Upload a file", "Live recording"],
         label_visibility="collapsed",
     )
+
+    default_idx = 0
+    if st.session_state.language in LANGUAGE_OPTIONS:
+        default_idx = LANGUAGE_OPTIONS.index(st.session_state.language)
+
+    language = st.selectbox(
+        "Spoken language",
+        LANGUAGE_OPTIONS,
+        index=default_idx,
+    )
+    st.session_state.language = language
+
+    keep_original_nepali = False
+    if language == "Nepali speech → English text":
+        keep_original_nepali = st.checkbox(
+            "Keep original Devanagari transcript alongside English translation",
+            value=True,
+            help="Transcribes original Nepali speech in Devanagari script in addition to the English translation.",
+        )
 
     source, source_label = None, ""
     if input_mode == "YouTube link":
@@ -596,12 +619,14 @@ with st.sidebar:
                     snap = st.session_state.live_transcriber.transcript.get_snapshot()
                     sess_id = f"live_{uuid.uuid4().hex[:8]}"
                     st.session_state.result = process_live_intelligence_ui(
-                        transcript=snap["text"],
-                        segments=snap["segments"],
+                        transcript=snap.get("full_text", snap.get("text", "")),
+                        segments=snap.get("segments", []),
                         language=language,
                         audio_source=f"Live Recording ({rec.source.value})",
-                        duration_seconds=rec.get_elapsed_time(),
+                        duration_seconds=rec.get_elapsed_seconds(),
                         session_id=sess_id,
+                        dropped_chunks_count=snap.get("dropped_chunks_count", 0),
+                        dropped_audio_seconds=snap.get("dropped_audio_seconds", 0.0),
                     )
                     st.session_state.source_label = f"Live Recording ({rec.source.value})"
                     st.session_state.language = language
@@ -652,25 +677,6 @@ with st.sidebar:
             st.audio(st.session_state.recorded_audio_path)
             source = st.session_state.recorded_audio_path
             source_label = f"Live Recording ({rec.source.value})"
-
-    default_idx = 0
-    if st.session_state.language in LANGUAGE_OPTIONS:
-        default_idx = LANGUAGE_OPTIONS.index(st.session_state.language)
-
-    language = st.selectbox(
-        "Spoken language",
-        LANGUAGE_OPTIONS,
-        index=default_idx,
-    )
-
-    keep_original_nepali = False
-    if language == "Nepali speech → English text":
-        keep_original_nepali = st.checkbox(
-            "Keep original Devanagari transcript alongside English translation",
-            value=True,
-            help="Transcribes original Nepali speech in Devanagari script in addition to the English translation.",
-        )
-
     analyze = st.button(
         "Analyze video", type="primary", use_container_width=True, disabled=source is None
     )
@@ -796,87 +802,18 @@ def render_results(result: dict):
             t_cols[2].metric("LLM Analysis", f"{llm_total:.2f}s")
             t_cols[3].metric("Vector Store", f"{st_timings.get('ChromaDB Indexing', 0.0):.2f}s")
 
-    tab_summary, tab_notes, tab_chat, tab_transcript = st.tabs(
-        ["Summary", "Action items and decisions", "Ask the video", "Transcript"]
+    tab_transcript, tab_summary, tab_notes, tab_chat = st.tabs(
+        ["Transcript", "Summary", "Action items and decisions", "Ask the video"]
     )
 
-    with tab_summary:
-        with st.container(border=True):
-            st.markdown(result["summary"])
-
-    with tab_notes:
-        col_a, col_b = st.columns(2, gap="medium")
-        with col_a:
-            with st.container(border=True):
-                st.subheader("Action items")
-                structured_items = result.get("structured_action_items")
-                if structured_items:
-                    for i, item in enumerate(structured_items, 1):
-                        p_badge = {"High": "🔴 High", "Medium": "🟡 Medium", "Low": "🟢 Low"}.get(getattr(item, "priority", "Medium"), "🟡 Medium")
-                        ts_badge = f"⏱️ `[{item.citation.timestamp_str}]`" if (hasattr(item, "citation") and item.citation) else ""
-                        st.markdown(f"**{i}. {item.task}**")
-                        owner_val = getattr(item, "owner", "Unknown") or "Unknown"
-                        deadline_val = getattr(item, "deadline", "Not specified") or "Not specified"
-                        st.caption(f"👤 **Assignee:** {owner_val} &nbsp;|&nbsp; {p_badge} &nbsp;|&nbsp; 📅 **Due:** {deadline_val} {f'&nbsp;|&nbsp; ' + ts_badge if ts_badge else ''}")
-                        st.divider()
-                else:
-                    st.markdown(result["action_items"])
-        with col_b:
-            with st.container(border=True):
-                st.subheader("Key decisions")
-                structured_decs = result.get("structured_key_decisions")
-                if structured_decs:
-                    for i, dec in enumerate(structured_decs, 1):
-                        ts_badge = f"⏱️ `[{dec.citation.timestamp_str}]`" if (hasattr(dec, "citation") and dec.citation) else ""
-                        st.markdown(f"**{i}. {dec.decision}**")
-                        rat_val = getattr(dec, "context_rationale", "Not specified") or "Not specified"
-                        owner_val = getattr(dec, "consensus_owner", "Unknown") or "Unknown"
-                        st.caption(f"💡 **Rationale:** {rat_val} &nbsp;|&nbsp; 🤝 **Consensus:** {owner_val} {f'&nbsp;|&nbsp; ' + ts_badge if ts_badge else ''}")
-                        st.divider()
-                else:
-                    st.markdown(result["key_decisions"])
-        with st.container(border=True):
-            st.subheader("Open questions")
-            st.markdown(result["open_questions"])
-
-    with tab_chat:
-        if not st.session_state.messages:
-            st.caption("Ask anything about the meeting, for example: “What action items were decided?”")
-
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        question = st.chat_input("Ask a question about this meeting")
-        if question:
-            st.session_state.messages.append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
-            with st.chat_message("assistant"):
-                with st.spinner("Searching the meeting transcript..."):
-                    try:
-                        resp = ask_post_meeting_question(
-                            rag_chain=result.get("rag_chain"),
-                            question=question,
-                            chat_history=st.session_state.messages[:-1],
-                            session_id=result.get("session_id", ""),
-                        )
-                        status_badge = f"📊 *Status: {resp.state.value.replace('_', ' ').title()}*\n\n"
-                        full_answer = status_badge + resp.answer
-                        if resp.citations:
-                            full_answer += "\n\n**Evidence & Citations:**"
-                            for c in resp.citations:
-                                full_answer += f"\n- `{c.timestamp_str}`: *\"{c.excerpt}\"*"
-                    except Exception as e:
-                        full_answer = f"I couldn't answer that: `{e}`"
-                st.markdown(full_answer)
-            st.session_state.messages.append({"role": "assistant", "content": full_answer})
-
-        if st.session_state.messages and st.button("Clear chat"):
-            st.session_state.messages = []
-            st.rerun()
-
     with tab_transcript:
+        if result.get("dropped_chunks_count", 0) > 0:
+            st.warning(
+                f"⚠️ Note: {result['dropped_chunks_count']} audio chunk(s) "
+                f"({result.get('dropped_audio_seconds', 0.0):.1f}s) were dropped during live recording "
+                "due to high system load. Some speech may be missing."
+            )
+
         col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 1])
         with col_dl1:
             # 1. Executive PDF Download
@@ -963,7 +900,92 @@ def render_results(result: dict):
                 st.write(result["original_transcript"])
 
         with st.container(border=True, height=480):
-            st.write(result["transcript"])
+            segments = result.get("segments")
+            if segments:
+                for seg in segments:
+                    t_start = format_timestamp(seg.get("start", 0.0))
+                    t_end = format_timestamp(seg.get("end", 0.0))
+                    seg_text = seg.get("text", "").strip()
+                    if seg_text:
+                        st.markdown(f"**`[{t_start} - {t_end}]`** {seg_text}")
+            else:
+                st.write(result["transcript"])
+
+    with tab_summary:
+        with st.container(border=True):
+            st.markdown(result["summary"])
+
+    with tab_notes:
+        col_a, col_b = st.columns(2, gap="medium")
+        with col_a:
+            with st.container(border=True):
+                st.subheader("Action items")
+                structured_items = result.get("structured_action_items")
+                if structured_items:
+                    for i, item in enumerate(structured_items, 1):
+                        p_badge = {"High": "🔴 High", "Medium": "🟡 Medium", "Low": "🟢 Low"}.get(getattr(item, "priority", "Medium"), "🟡 Medium")
+                        ts_badge = f"⏱️ `[{item.citation.timestamp_str}]`" if (hasattr(item, "citation") and item.citation) else ""
+                        st.markdown(f"**{i}. {item.task}**")
+                        owner_val = getattr(item, "owner", "Unknown") or "Unknown"
+                        deadline_val = getattr(item, "deadline", "Not specified") or "Not specified"
+                        st.caption(f"👤 **Assignee:** {owner_val} &nbsp;|&nbsp; {p_badge} &nbsp;|&nbsp; 📅 **Due:** {deadline_val} {f'&nbsp;|&nbsp; ' + ts_badge if ts_badge else ''}")
+                        st.divider()
+                else:
+                    st.markdown(result["action_items"])
+        with col_b:
+            with st.container(border=True):
+                st.subheader("Key decisions")
+                structured_decs = result.get("structured_key_decisions")
+                if structured_decs:
+                    for i, dec in enumerate(structured_decs, 1):
+                        ts_badge = f"⏱️ `[{dec.citation.timestamp_str}]`" if (hasattr(dec, "citation") and dec.citation) else ""
+                        st.markdown(f"**{i}. {dec.decision}**")
+                        rat_val = getattr(dec, "context_rationale", "Not specified") or "Not specified"
+                        owner_val = getattr(dec, "consensus_owner", "Unknown") or "Unknown"
+                        st.caption(f"💡 **Rationale:** {rat_val} &nbsp;|&nbsp; 🤝 **Consensus:** {owner_val} {f'&nbsp;|&nbsp; ' + ts_badge if ts_badge else ''}")
+                        st.divider()
+                else:
+                    st.markdown(result["key_decisions"])
+        with st.container(border=True):
+            st.subheader("Open questions")
+            st.markdown(result["open_questions"])
+
+    with tab_chat:
+        if not st.session_state.messages:
+            st.caption("Ask anything about the meeting, for example: “What action items were decided?”")
+
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        question = st.chat_input("Ask a question about this meeting")
+        if question:
+            st.session_state.messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+            with st.chat_message("assistant"):
+                with st.spinner("Searching the meeting transcript..."):
+                    try:
+                        resp = ask_post_meeting_question(
+                            rag_chain=result.get("rag_chain"),
+                            question=question,
+                            chat_history=st.session_state.messages[:-1],
+                            session_id=result.get("session_id", ""),
+                        )
+                        status_badge = f"📊 *Status: {resp.state.value.replace('_', ' ').title()}*\n\n"
+                        full_answer = status_badge + resp.answer
+                        if resp.citations:
+                            full_answer += "\n\n**Evidence & Citations:**"
+                            for c in resp.citations:
+                                full_answer += f"\n- `{c.timestamp_str}`: *\"{c.excerpt}\"*"
+                    except Exception as e:
+                        full_answer = f"I couldn't answer that: `{e}`"
+                st.markdown(full_answer)
+            st.session_state.messages.append({"role": "assistant", "content": full_answer})
+
+        if st.session_state.messages and st.button("Clear chat"):
+            st.session_state.messages = []
+            st.rerun()
 
 
 if result:
