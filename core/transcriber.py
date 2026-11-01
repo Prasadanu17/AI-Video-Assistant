@@ -1,4 +1,27 @@
 import os
+import sys
+# Ensure UTF-8 console output and graceful encoding fallback on Windows
+for _s in ('stdout', 'stderr'):
+    _stream = getattr(sys, _s, None)
+    if _stream and hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+_builtin_print = print
+
+def print(*args, **kwargs):
+    try:
+        _builtin_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        _enc = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        _safe_args = [
+            str(a).replace('→', '->').encode(_enc, errors='replace').decode(_enc, errors='replace')
+            if isinstance(a, str) else a
+            for a in args
+        ]
+        _builtin_print(*_safe_args, **kwargs)
 import threading
 import requests
 from pydub import AudioSegment
@@ -36,14 +59,14 @@ LANGUAGE_CONFIG = {
     "ne": {"engine": "whisper", "whisper_code": "ne", "default_task": "transcribe", "display_name": "Nepali (Devanagari)"},
 
     # Nepali-to-English Translation
-    "nepali-to-english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "nepali_to_english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "nepali speech → english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "nepali speech -> english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "nepali-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "ne-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "ne-to-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
-    "nepali_translate": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali → English Translation"},
+    "nepali-to-english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali_to_english": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali speech → english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali speech -> english text": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "ne-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "ne-to-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
+    "nepali_translate": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
 
     # Auto-detection
     "auto": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
@@ -251,12 +274,23 @@ def transcribe_chunk_whisper(
     else:
         raise TypeError(f"chunk_path must be a file path string or numpy array, got {type(chunk_path)}")
 
-    model = load_model()
-    validate_whisper_model(model, language=language, task=task)
-
-    transcribe_kwargs = {"task": task}
+    # Resolve language mode if an alias or descriptive name was passed
+    resolved_lang = language
+    resolved_task = task or "transcribe"
     if language is not None:
-        transcribe_kwargs["language"] = language
+        try:
+            mode_cfg = resolve_language_mode(language, task=task)
+            resolved_lang = mode_cfg.get("whisper_code")
+            resolved_task = mode_cfg.get("task", resolved_task)
+        except Exception:
+            pass
+
+    model = load_model()
+    validate_whisper_model(model, language=resolved_lang, task=resolved_task)
+
+    transcribe_kwargs = {"task": resolved_task}
+    if resolved_lang is not None:
+        transcribe_kwargs["language"] = resolved_lang
 
     # Configure beam size and robust decoding parameters for faster-whisper
     if type(model).__name__ == "WhisperModel":

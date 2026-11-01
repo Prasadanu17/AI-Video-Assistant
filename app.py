@@ -6,6 +6,29 @@ Place this file next to your existing `utils/` and `core/` folders and .env.
 """
 import io
 import os
+import sys
+# Ensure UTF-8 console output and graceful encoding fallback on Windows
+for _s in ('stdout', 'stderr'):
+    _stream = getattr(sys, _s, None)
+    if _stream and hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+_builtin_print = print
+
+def print(*args, **kwargs):
+    try:
+        _builtin_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        _enc = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        _safe_args = [
+            str(a).replace('→', '->').encode(_enc, errors='replace').decode(_enc, errors='replace')
+            if isinstance(a, str) else a
+            for a in args
+        ]
+        _builtin_print(*_safe_args, **kwargs)
 import shutil
 import tempfile
 import time
@@ -615,7 +638,7 @@ with st.sidebar:
                     final_live_text = st.session_state.live_transcriber.stop()
                     st.session_state.live_transcript_text = final_live_text
 
-                if not retranscribe_offline and st.session_state.get("live_transcriber") and st.session_state.live_transcript_text:
+                if not retranscribe_offline and st.session_state.get("live_transcriber") and st.session_state.live_transcript_text and st.session_state.live_transcript_text.strip():
                     snap = st.session_state.live_transcriber.transcript.get_snapshot()
                     sess_id = f"live_{uuid.uuid4().hex[:8]}"
                     st.session_state.result = process_live_intelligence_ui(
@@ -632,10 +655,20 @@ with st.sidebar:
                     st.session_state.language = language
                     st.session_state.session_id = sess_id
                     st.rerun()
-                elif st.session_state.recorded_audio_path:
-                    source = st.session_state.recorded_audio_path
-                    source_label = f"Live Recording ({rec.source.value})"
-                    analyze = True
+                elif st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
+                    sess_id = f"live_{uuid.uuid4().hex[:8]}"
+                    st.session_state.result = run_pipeline_ui(
+                        source=st.session_state.recorded_audio_path,
+                        language=language,
+                        keep_original_nepali=keep_original_nepali,
+                        session_id=sess_id,
+                    )
+                    st.session_state.source_label = f"Live Recording ({rec.source.value})"
+                    st.session_state.language = language
+                    st.session_state.session_id = sess_id
+                    st.rerun()
+                else:
+                    st.warning("No audio recording found. Please record some audio before generating notes.")
 
         # Display live transcript streaming status & live Q&A during recording
         if st.session_state.get("live_transcriber"):
