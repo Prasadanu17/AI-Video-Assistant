@@ -489,6 +489,36 @@ def build_report(result: dict) -> str:
     return report
 
 
+@st.fragment(run_every="2s")
+def render_live_recording_monitor(recorder_obj, transcriber_obj):
+    """Auto-refreshing monitor showing live recording progress, audio energy meters, and transcript."""
+    elapsed_time = recorder_obj.get_elapsed_seconds()
+    mic_p, lb_p = recorder_obj.get_peak_levels()
+    snap = transcriber_obj.transcript.get_snapshot() if transcriber_obj else {}
+
+    st.error(f"🔴 **Recording in progress...** ({elapsed_time:.1f}s)")
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.caption(f"🎙️ Mic Level: {int(mic_p * 100)}%")
+        st.progress(min(max(float(mic_p), 0.0), 1.0))
+    with col_m2:
+        st.caption(f"🔊 Meeting Audio: {int(lb_p * 100)}%")
+        st.progress(min(max(float(lb_p), 0.0), 1.0))
+
+    if snap.get("is_busy"):
+        st.caption("⚡ *Transcriber listening & processing audio chunk...*")
+
+    segs = snap.get("segments", [])
+    if segs:
+        with st.expander(f"📝 Live Transcript ({len(segs)} segment{'s' if len(segs) != 1 else ''})", expanded=True):
+            for s in segs[-8:]:
+                st.caption(f"[{format_timestamp(s['start'])} - {format_timestamp(s['end'])}]")
+                st.write(s["text"])
+    else:
+        st.info("🎧 Carefully listening... Speak into your microphone; live text will appear here automatically.")
+
+
 # --------------------------------------------------------------------------
 # Sidebar - input
 # --------------------------------------------------------------------------
@@ -560,7 +590,7 @@ with st.sidebar:
         if rec_state == RecordingState.IDLE:
             st.info("⚪ Ready to record. Click **Start recording** to begin capturing.")
         elif rec_state == RecordingState.RECORDING:
-            st.error(f"🔴 **Recording in progress...** ({elapsed:.1f}s)")
+            render_live_recording_monitor(rec, st.session_state.get("live_transcriber"))
         elif rec_state == RecordingState.PAUSED:
             st.warning(f"⏸️ **Recording paused** ({elapsed:.1f}s)")
         elif rec_state == RecordingState.STOPPED:
@@ -671,7 +701,7 @@ with st.sidebar:
                     st.warning("No audio recording found. Please record some audio before generating notes.")
 
         # Display live transcript streaming status & live Q&A during recording
-        if st.session_state.get("live_transcriber"):
+        if rec_state != RecordingState.RECORDING and st.session_state.get("live_transcriber"):
             snap = st.session_state.live_transcriber.transcript.get_snapshot()
             if snap["segments"]:
                 with st.expander(f"📝 Live Transcript ({snap['segment_count']} segment{'s' if snap['segment_count'] != 1 else ''})", expanded=True):

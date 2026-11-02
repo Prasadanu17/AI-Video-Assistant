@@ -251,6 +251,7 @@ def transcribe_chunk_whisper(
     language: str = None,
     task: str = "transcribe",
     return_segments: bool = False,
+    initial_prompt: str = None,
 ) -> str | dict:
     """
     Transcribe or translate an audio chunk using faster-whisper or fallback Whisper.
@@ -260,6 +261,7 @@ def transcribe_chunk_whisper(
         language: Whisper language code ('en', 'hi', 'ne', or None for auto-detect).
         task: 'transcribe' (default) or 'translate' (translates to English).
         return_segments: Whether to return full segments with timestamps.
+        initial_prompt: Optional context prompt to prime continuous vocabulary and grammar.
     """
     if isinstance(chunk_path, np.ndarray):
         if chunk_path.size == 0:
@@ -294,12 +296,20 @@ def transcribe_chunk_whisper(
 
     # Configure beam size and robust decoding parameters for faster-whisper
     if type(model).__name__ == "WhisperModel":
-        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
+        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
         transcribe_kwargs["condition_on_previous_text"] = False
         use_vad = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() in ("1", "true", "yes")
         if use_vad:
             transcribe_kwargs["vad_filter"] = True
-            transcribe_kwargs["vad_parameters"] = dict(min_silence_duration_ms=400)
+            transcribe_kwargs["vad_parameters"] = dict(
+                threshold=float(os.getenv("WHISPER_VAD_THRESHOLD", "0.35")),
+                min_silence_duration_ms=int(os.getenv("WHISPER_MIN_SILENCE_MS", "400")),
+                speech_pad_ms=int(os.getenv("WHISPER_SPEECH_PAD_MS", "250")),
+            )
+        transcribe_kwargs["no_speech_threshold"] = float(os.getenv("WHISPER_NO_SPEECH_THRESH", "0.45"))
+        transcribe_kwargs["compression_ratio_threshold"] = 2.4
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = initial_prompt
 
     try:
         try:
@@ -313,13 +323,33 @@ def transcribe_chunk_whisper(
             else:
                 raise
 
-
         # 1. Faster-whisper output format: (segments_generator, info)
         if isinstance(raw_result, tuple) and len(raw_result) == 2:
-            segments_iter, _ = raw_result
+            segments_iter, info = raw_result
+            segments_list = list(segments_iter)
+
+            # Sensitive VAD recovery: if VAD produced no segments on audible audio, retry without VAD
+            if not segments_list and transcribe_kwargs.get("vad_filter"):
+                has_audible_energy = False
+                if isinstance(chunk_path, np.ndarray) and len(chunk_path) > 0:
+                    arr_rms = float(np.sqrt(np.mean(chunk_path.astype(np.float32) ** 2)))
+                    if arr_rms > 1.5:
+                        arr_rms /= 32768.0
+                    has_audible_energy = arr_rms >= 0.0012
+                if has_audible_energy:
+                    retry_kwargs = dict(transcribe_kwargs)
+                    retry_kwargs.pop("vad_filter", None)
+                    retry_kwargs.pop("vad_parameters", None)
+                    try:
+                        raw_retry = model.transcribe(chunk_path, **retry_kwargs)
+                        if isinstance(raw_retry, tuple) and len(raw_retry) == 2:
+                            segments_list = list(raw_retry[0])
+                    except Exception:
+                        pass
+
             text_parts = []
             segments = []
-            for seg in segments_iter:
+            for seg in segments_list:
                 seg_text = getattr(seg, "text", "").strip()
                 if seg_text:
                     text_parts.append(seg_text)
@@ -417,6 +447,7 @@ def transcribe_chunk(
     language: str = "english",
     task: str = None,
     return_segments: bool = False,
+    initial_prompt: str = None,
 ) -> str | dict:
     """
     Route one chunk to Whisper or Sarvam depending on the language/mode configuration.
@@ -433,6 +464,7 @@ def transcribe_chunk(
         language=cfg["whisper_code"],
         task=cfg["task"],
         return_segments=return_segments,
+        initial_prompt=initial_prompt,
     )
 
 

@@ -340,7 +340,7 @@ class AudioRecorder:
             self._live_mic_fifo = self._live_mic_fifo[min_len:]
             self._live_lb_fifo = self._live_lb_fifo[min_len:]
 
-            mixed = 0.5 * mic_block + 0.5 * lb_block
+            mixed = self._mix_audio_streams(mic_block, lb_block)
             self._live_chunker.feed_samples(mixed, is_paused=False)
         elif len(self._live_mic_fifo) > 16000 and len(self._live_lb_fifo) == 0:
             # Loopback is silent/inactive: advance mic audio so live transcription does not stall

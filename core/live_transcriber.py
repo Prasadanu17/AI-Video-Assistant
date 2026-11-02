@@ -164,7 +164,8 @@ def deduplicate_overlap(
         return new_text.strip()
 
     def clean_word(w: str) -> str:
-        return re.sub(r"[^\w\s]", "", w.strip().lower())
+        # Preserve alphanumeric, Devanagari (\u0900-\u097F), and standard word characters
+        return re.sub(r"[^\w\u0900-\u097F\s]", "", w.strip().lower())
 
     # Check for matching word sequences of length k down to min_match_words
     max_k = min(len(prev_words), len(new_words), max_check_words)
@@ -177,12 +178,13 @@ def deduplicate_overlap(
             best_overlap = k
             break
 
-    # If no multi-word match, check if 1-word overlap is a distinctive long word (>= 6 chars)
+    # If no multi-word match, check if 1-word overlap is a distinctive long word (>= 6 chars for Latin, >= 5 chars for Devanagari)
     # AND that prev_words does not end with a deliberate duplicate
     if best_overlap == 0 and len(prev_words) >= 1 and len(new_words) >= 1:
         prev_w = clean_word(prev_words[-1])
         new_w = clean_word(new_words[0])
-        if prev_w == new_w and len(prev_w) >= 6:
+        min_single_len = 5 if any("\u0900" <= c <= "\u097F" for c in prev_w) else 6
+        if prev_w and prev_w == new_w and len(prev_w) >= min_single_len:
             # Check it's not intentional repetition like 'really really'
             if len(prev_words) < 2 or clean_word(prev_words[-2]) != prev_w:
                 best_overlap = 1
@@ -201,14 +203,15 @@ def preprocess_audio_chunk(
     pcm_data: np.ndarray,
     sample_rate: int = 16000,
     target_peak: float = 0.65,
-    max_gain: float = 2.8,
+    max_gain: float = 3.5,
 ) -> Tuple[np.ndarray, dict]:
     """
     Safely preprocess audio samples for robust transcription:
     - Normalizes dtype to float32.
+    - Subtracts DC offset to eliminate microphone rumble/drift.
     - Measures peak amplitude and RMS energy.
     - Detects clipping and near-silence.
-    - Boosts quiet speech without amplifying background noise floor.
+    - Carefully boosts quiet/soft speech without amplifying background noise floor.
     - Applies gentle soft-limiting to eliminate hard clipping distortion.
     """
     if len(pcm_data) == 0:
@@ -230,6 +233,11 @@ def preprocess_audio_chunk(
         if max_val > 1.5:
             samples = samples / 32768.0
 
+    # Remove DC offset (baseline sensor bias / low-frequency rumble)
+    if len(samples) > 0:
+        dc_bias = float(np.mean(samples))
+        samples = samples - dc_bias
+
     peak = float(np.max(np.abs(samples))) if len(samples) > 0 else 0.0
     rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
 
@@ -240,12 +248,13 @@ def preprocess_audio_chunk(
     else:
         is_clipped = False
 
-    is_near_silence = rms < 0.002
+    # Careful listener threshold: only label as near-silence when virtually no energy (< 0.0008)
+    is_near_silence = rms < 0.0008
 
     applied_gain = 1.0
-    # Apply safe dynamic gain boost only when speech energy is present (rms >= 0.003)
-    # and signal is quiet (peak < 0.35)
-    if not is_near_silence and rms >= 0.003 and peak > 0.01 and peak < 0.35:
+    # Apply safe dynamic gain boost when speech energy is present (rms >= 0.001)
+    # and signal is quiet (peak < 0.40)
+    if not is_near_silence and rms >= 0.001 and peak > 0.005 and peak < 0.40:
         applied_gain = min(target_peak / max(peak, 1e-4), max_gain)
         samples = samples * applied_gain
         peak = float(np.max(np.abs(samples)))
@@ -276,7 +285,7 @@ class LiveTranscriber:
         self,
         language: str = "english",
         chunk_seconds: float = 5.0,
-        overlap_seconds: float = 0.8,
+        overlap_seconds: float = 1.0,
         sample_rate: int = 16000,
         mock_mode: bool = False,
         on_segment_callback: Optional[Callable[[LiveTranscriptSegment], None]] = None,
@@ -575,6 +584,11 @@ class LiveTranscriber:
             if len(clean_pcm) == 0:
                 return
 
+            # Pass trailing context words as initial_prompt to prime continuous decoding
+            prev_context = self.transcript.full_text
+            trailing_words = [w for w in prev_context.split() if w]
+            initial_prompt = " ".join(trailing_words[-15:]) if trailing_words else None
+
             # Direct in-memory NumPy inference with safe fallback to temporary WAV
             try:
                 res = transcribe_chunk(
@@ -582,6 +596,7 @@ class LiveTranscriber:
                     language=self.whisper_lang,
                     task=self.whisper_task,
                     return_segments=True,
+                    initial_prompt=initial_prompt,
                 )
                 text = res["text"] if isinstance(res, dict) else str(res)
             except Exception as direct_err:
@@ -593,6 +608,7 @@ class LiveTranscriber:
                         language=self.whisper_lang,
                         task=self.whisper_task,
                         return_segments=True,
+                        initial_prompt=initial_prompt,
                     )
                     text = res["text"] if isinstance(res, dict) else str(res)
                 finally:
@@ -679,7 +695,7 @@ class LiveTranscriber:
 class LiveAudioChunker:
     """
     Slices a continuous stream of 16 kHz mono audio samples into
-    overlapping live chunks (e.g. 5.0s duration, 0.8s overlap) and
+    overlapping live chunks (e.g. 5.0s duration, 1.0s overlap) and
     dispatches them to the LiveTranscriber queue.
     """
 
@@ -688,7 +704,7 @@ class LiveAudioChunker:
         transcriber: LiveTranscriber,
         sample_rate: int = 16000,
         chunk_seconds: float = 5.0,
-        overlap_seconds: float = 0.8,
+        overlap_seconds: float = 1.0,
     ):
         self.transcriber = transcriber
         self.sample_rate = sample_rate
