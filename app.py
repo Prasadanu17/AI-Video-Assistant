@@ -201,6 +201,8 @@ st.session_state.setdefault("recorded_audio_path", None)
 st.session_state.setdefault("live_transcriber", None)
 st.session_state.setdefault("live_transcript_text", "")
 st.session_state.setdefault("live_messages", [])
+st.session_state.setdefault("trigger_live_intelligence", False)
+st.session_state.setdefault("retranscribe_offline_choice", False)
 if st.session_state.recorder is None:
     st.session_state.recorder = AudioRecorder()
 
@@ -301,11 +303,17 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
         decisions = llm_res["key_decisions"]
         questions = llm_res["open_questions"]
 
-        st.write(f"🔍 Indexing transcript for chat (session: {session_id})...")
-        progress_bar.progress(0.95, text=f"Indexing transcript into ChromaDB ({session_id})...")
-        t0 = time.perf_counter()
-        rag_chain = build_rag_chain(transcript, session_id=session_id, segments=segments)
-        stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
+        rag_chain = None
+        if transcript.strip():
+            try:
+                st.write(f"🔍 Indexing transcript for chat (session: {session_id})...")
+                progress_bar.progress(0.95, text=f"Indexing transcript into ChromaDB ({session_id})...")
+                t0 = time.perf_counter()
+                rag_chain = build_rag_chain(transcript, session_id=session_id, segments=segments)
+                stage_timings["ChromaDB Indexing"] = time.perf_counter() - t0
+            except Exception as rag_err:
+                print(f"[!] ChromaDB indexing notice: {rag_err}")
+                stage_timings["ChromaDB Indexing"] = 0.0
 
         t_total = time.perf_counter() - t_pipeline_start
         stage_timings["Total Pipeline Time"] = t_total
@@ -384,14 +392,26 @@ def process_live_intelligence_ui(
         stage_timings.update(llm_res.get("stage_timings", {}))
         stage_timings["LLM Analysis (Parallel)"] = time.perf_counter() - t_llm
 
-        st.write("🎯 Extracting structured action items and decisions with citations...")
-        structured_actions = extract_structured_action_items(transcript, segments=segments, max_duration=duration_seconds)
-        structured_decisions = extract_structured_decisions(transcript, segments=segments, max_duration=duration_seconds)
+        structured_actions = []
+        structured_decisions = []
+        if transcript.strip():
+            try:
+                st.write("🎯 Extracting structured action items and decisions with citations...")
+                structured_actions = extract_structured_action_items(transcript, segments=segments, max_duration=duration_seconds)
+                structured_decisions = extract_structured_decisions(transcript, segments=segments, max_duration=duration_seconds)
+            except Exception as struct_err:
+                print(f"[!] Structured extraction notice: {struct_err}")
 
-        st.write(f"🔍 Indexing transcript for grounded Q&A (session: {session_id})...")
-        t_rag = time.perf_counter()
-        rag_chain = build_rag_chain(transcript, session_id=session_id, segments=segments)
-        stage_timings["ChromaDB Indexing"] = time.perf_counter() - t_rag
+        rag_chain = None
+        if transcript.strip():
+            try:
+                st.write(f"🔍 Indexing transcript for grounded Q&A (session: {session_id})...")
+                t_rag = time.perf_counter()
+                rag_chain = build_rag_chain(transcript, session_id=session_id, segments=segments)
+                stage_timings["ChromaDB Indexing"] = time.perf_counter() - t_rag
+            except Exception as rag_err:
+                print(f"[!] ChromaDB indexing notice: {rag_err}")
+                stage_timings["ChromaDB Indexing"] = 0.0
 
         t_total = time.perf_counter() - t_start
         stage_timings["Total Pipeline Time"] = t_total
@@ -626,6 +646,18 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to stop recording: {e}")
+
+            if st.button("⏹️ Stop & Generate Notes", type="primary", use_container_width=True):
+                try:
+                    wav_file = rec.stop()
+                    st.session_state.recorded_audio_path = wav_file
+                    if st.session_state.get("live_transcriber"):
+                        final_live_text = st.session_state.live_transcriber.stop()
+                        st.session_state.live_transcript_text = final_live_text
+                    st.session_state.trigger_live_intelligence = True
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to stop recording: {e}")
         elif rec_state == RecordingState.PAUSED:
             if col_r1.button("Resume", type="primary", use_container_width=True):
                 rec.resume()
@@ -652,6 +684,7 @@ with st.sidebar:
                 st.session_state.live_messages = []
                 st.session_state.recorded_audio_path = None
                 st.session_state.result = None
+                st.session_state.trigger_live_intelligence = False
                 st.rerun()
 
             btn_gen_notes = col_r2.button("Generate Notes", type="primary", use_container_width=True)
@@ -663,42 +696,9 @@ with st.sidebar:
             )
 
             if btn_gen_notes:
-                # Flush pending transcription before generating meeting notes
-                if st.session_state.get("live_transcriber"):
-                    final_live_text = st.session_state.live_transcriber.stop()
-                    st.session_state.live_transcript_text = final_live_text
-
-                if not retranscribe_offline and st.session_state.get("live_transcriber") and st.session_state.live_transcript_text and st.session_state.live_transcript_text.strip():
-                    snap = st.session_state.live_transcriber.transcript.get_snapshot()
-                    sess_id = f"live_{uuid.uuid4().hex[:8]}"
-                    st.session_state.result = process_live_intelligence_ui(
-                        transcript=snap.get("full_text", snap.get("text", "")),
-                        segments=snap.get("segments", []),
-                        language=language,
-                        audio_source=f"Live Recording ({rec.source.value})",
-                        duration_seconds=rec.get_elapsed_seconds(),
-                        session_id=sess_id,
-                        dropped_chunks_count=snap.get("dropped_chunks_count", 0),
-                        dropped_audio_seconds=snap.get("dropped_audio_seconds", 0.0),
-                    )
-                    st.session_state.source_label = f"Live Recording ({rec.source.value})"
-                    st.session_state.language = language
-                    st.session_state.session_id = sess_id
-                    st.rerun()
-                elif st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
-                    sess_id = f"live_{uuid.uuid4().hex[:8]}"
-                    st.session_state.result = run_pipeline_ui(
-                        source=st.session_state.recorded_audio_path,
-                        language=language,
-                        keep_original_nepali=keep_original_nepali,
-                        session_id=sess_id,
-                    )
-                    st.session_state.source_label = f"Live Recording ({rec.source.value})"
-                    st.session_state.language = language
-                    st.session_state.session_id = sess_id
-                    st.rerun()
-                else:
-                    st.warning("No audio recording found. Please record some audio before generating notes.")
+                st.session_state.trigger_live_intelligence = True
+                st.session_state.retranscribe_offline_choice = retranscribe_offline
+                st.rerun()
 
         # Display live transcript streaming status & live Q&A during recording
         if rec_state != RecordingState.RECORDING and st.session_state.get("live_transcriber"):
@@ -740,9 +740,12 @@ with st.sidebar:
             st.audio(st.session_state.recorded_audio_path)
             source = st.session_state.recorded_audio_path
             source_label = f"Live Recording ({rec.source.value})"
-    analyze = st.button(
-        "Analyze video", type="primary", use_container_width=True, disabled=source is None
-    )
+    if input_mode != "Live recording":
+        analyze = st.button(
+            "Analyze video", type="primary", use_container_width=True, disabled=source is None
+        )
+    else:
+        analyze = False
 
     if st.session_state.result:
         st.divider()
@@ -763,7 +766,72 @@ with st.sidebar:
             st.session_state.live_transcriber = None
             st.session_state.live_transcript_text = ""
             st.session_state.live_messages = []
+            st.session_state.trigger_live_intelligence = False
             st.rerun()
+
+# --------------------------------------------------------------------------
+# Run pipeline: Live Recording Intelligence (Main Area Execution)
+# --------------------------------------------------------------------------
+if st.session_state.get("trigger_live_intelligence"):
+    st.session_state.trigger_live_intelligence = False
+    st.session_state.messages = []
+    rec = st.session_state.recorder
+    live_trans = st.session_state.get("live_transcriber")
+    do_offline = st.session_state.get("retranscribe_offline_choice", False)
+
+    # Flush pending live chunks
+    if live_trans:
+        try:
+            final_live_text = live_trans.stop()
+            st.session_state.live_transcript_text = final_live_text
+        except Exception as e:
+            print(f"[!] Live transcriber stop error: {e}")
+
+    has_live_transcript = bool(
+        live_trans is not None
+        and st.session_state.live_transcript_text
+        and st.session_state.live_transcript_text.strip()
+    )
+
+    sess_id = f"live_{uuid.uuid4().hex[:8]}"
+
+    try:
+        if not do_offline and has_live_transcript:
+            snap = live_trans.transcript.get_snapshot()
+            transcript_text = snap.get("full_text", snap.get("text", "")).strip()
+            if not transcript_text:
+                transcript_text = st.session_state.live_transcript_text.strip()
+
+            st.session_state.result = process_live_intelligence_ui(
+                transcript=transcript_text,
+                segments=snap.get("segments", []),
+                language=language,
+                audio_source=f"Live Recording ({rec.source.value if rec else 'Audio'})",
+                duration_seconds=rec.get_elapsed_seconds() if rec else 0.0,
+                session_id=sess_id,
+                dropped_chunks_count=snap.get("dropped_chunks_count", 0),
+                dropped_audio_seconds=snap.get("dropped_audio_seconds", 0.0),
+            )
+        elif st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
+            st.session_state.result = run_pipeline_ui(
+                source=st.session_state.recorded_audio_path,
+                language=language,
+                keep_original_nepali=keep_original_nepali,
+                session_id=sess_id,
+            )
+        else:
+            st.warning("No audio recording found. Please speak into your microphone and record audio first.")
+
+        if st.session_state.result:
+            st.session_state.source_label = f"Live Recording ({rec.source.value if rec else 'Audio'})"
+            st.session_state.language = language
+            st.session_state.session_id = sess_id
+    except Exception as e:
+        st.session_state.result = None
+        st.error(
+            f"Something went wrong while generating meeting notes.\n\n`{e}`\n\n"
+            "Make sure your MISTRAL_API_KEY is set in .env."
+        )
 
 # --------------------------------------------------------------------------
 # Run pipeline
