@@ -472,3 +472,197 @@ def generate_markdown_report(intelligence_data: dict) -> str:
         lines.append(intelligence_data["original_transcript"].strip())
 
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# DOCX Report Generation (Phase 6)
+# --------------------------------------------------------------------------
+
+def generate_docx_report(intelligence_data: Dict[str, Any]) -> bytes:
+    """
+    Generate a publication-grade Microsoft Word (.docx) meeting report.
+    Includes title, metadata, executive summary, action item & decision tables,
+    and timestamped transcript. Returns raw bytes.
+    """
+    import io
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    doc = Document()
+
+    # 1. Title
+    title = intelligence_data.get("title", "Meeting Intelligence Report")
+    title_p = doc.add_paragraph()
+    title_run = title_p.add_run(title)
+    title_run.font.size = Pt(22)
+    title_run.font.bold = True
+    title_run.font.color.rgb = RGBColor(30, 41, 59)
+    title_p.paragraph_format.space_after = Pt(4)
+
+    # 2. Metadata Subheading
+    meta = intelligence_data.get("metadata", {})
+    date_str = meta.get("date", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    dur_str = meta.get("duration", "N/A")
+    lang_str = meta.get("language", "English")
+    src_str = meta.get("audio_source", "Recording")
+
+    meta_p = doc.add_paragraph()
+    meta_run = meta_p.add_run(f"Date: {date_str}   |   Duration: {dur_str}   |   Language: {lang_str}   |   Source: {src_str}")
+    meta_run.font.size = Pt(9.5)
+    meta_run.font.color.rgb = RGBColor(100, 116, 139)
+    meta_p.paragraph_format.space_after = Pt(14)
+
+    # 3. Executive Summary
+    summary = intelligence_data.get("summary", "")
+    if summary:
+        h1 = doc.add_heading("1. Executive Summary", level=1)
+        h1.paragraph_format.space_before = Pt(12)
+        h1.paragraph_format.space_after = Pt(6)
+        sum_p = doc.add_paragraph(summary)
+        sum_p.paragraph_format.line_spacing = 1.15
+        sum_p.paragraph_format.space_after = Pt(12)
+
+    # 4. Action Items Table
+    action_items = intelligence_data.get("action_items", [])
+    if action_items:
+        h2 = doc.add_heading("2. Action Items", level=1)
+        h2.paragraph_format.space_before = Pt(12)
+        h2.paragraph_format.space_after = Pt(6)
+
+        table = doc.add_table(rows=1, cols=6)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = "Table Grid"
+        hdr_cells = table.rows[0].cells
+        headers = ["#", "Task Description", "Assignee", "Priority", "Deadline", "Citation"]
+        for idx, text in enumerate(headers):
+            hdr_cells[idx].text = text
+            for p in hdr_cells[idx].paragraphs:
+                for run in p.runs:
+                    run.font.bold = True
+                    run.font.size = Pt(9.5)
+
+        for i, item in enumerate(action_items, 1):
+            row_cells = table.add_row().cells
+            row_cells[0].text = str(i)
+            task = getattr(item, "task", None) or (item.get("task") if isinstance(item, dict) else str(item))
+            owner = getattr(item, "assignee", None) or getattr(item, "owner", None) or (item.get("assignee") or item.get("owner", "Unknown") if isinstance(item, dict) else "Unknown")
+            priority = getattr(item, "priority", None) or (item.get("priority", "Medium") if isinstance(item, dict) else "Medium")
+            deadline = getattr(item, "deadline", None) or (item.get("deadline", "Not specified") if isinstance(item, dict) else "Not specified")
+            ts = getattr(item, "timestamp", None) or (item.get("timestamp", "-") if isinstance(item, dict) else "-")
+            if hasattr(item, "citation") and getattr(item, "citation"):
+                ts = item.citation.timestamp_str
+
+            row_cells[1].text = str(task)
+            row_cells[2].text = str(owner or "Unknown")
+            row_cells[3].text = str(priority or "Medium")
+            row_cells[4].text = str(deadline or "Not specified")
+            row_cells[5].text = str(ts or "-")
+            for cell in row_cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(9.0)
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(10)
+
+    # 5. Key Decisions Table
+    decisions = intelligence_data.get("key_decisions", [])
+    if decisions:
+        h3 = doc.add_heading("3. Key Decisions", level=1)
+        h3.paragraph_format.space_before = Pt(12)
+        h3.paragraph_format.space_after = Pt(6)
+
+        table_d = doc.add_table(rows=1, cols=5)
+        table_d.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table_d.style = "Table Grid"
+        d_hdr = table_d.rows[0].cells
+        d_headers = ["#", "Decision Agreed Upon", "Rationale / Context", "Consensus / Owner", "Citation"]
+        for idx, text in enumerate(d_headers):
+            d_hdr[idx].text = text
+            for p in d_hdr[idx].paragraphs:
+                for run in p.runs:
+                    run.font.bold = True
+                    run.font.size = Pt(9.5)
+
+        for i, dec in enumerate(decisions, 1):
+            row_cells = table_d.add_row().cells
+            row_cells[0].text = str(i)
+            decision = getattr(dec, "decision", None) or (dec.get("decision") if isinstance(dec, dict) else str(dec))
+            rationale = getattr(dec, "rationale", None) or getattr(dec, "context_rationale", None) or (dec.get("rationale") or dec.get("context_rationale", "Not specified") if isinstance(dec, dict) else "Not specified")
+            owner = getattr(dec, "decision_makers", None) or getattr(dec, "consensus_owner", None) or (dec.get("decision_makers") or dec.get("consensus_owner", "Unknown") if isinstance(dec, dict) else "Unknown")
+            ts = getattr(dec, "timestamp", None) or (dec.get("timestamp", "-") if isinstance(dec, dict) else "-")
+            if hasattr(dec, "citation") and getattr(dec, "citation"):
+                ts = dec.citation.timestamp_str
+
+            row_cells[1].text = str(decision)
+            row_cells[2].text = str(rationale or "Not specified")
+            row_cells[3].text = str(owner or "Unknown")
+            row_cells[4].text = str(ts or "-")
+            for cell in row_cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(9.0)
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(10)
+
+    # 6. Minutes of Meeting
+    mom = intelligence_data.get("minutes_of_meeting")
+    if mom:
+        h_mom = doc.add_heading("4. Formal Minutes of Meeting (MoM)", level=1)
+        h_mom.paragraph_format.space_before = Pt(12)
+        h_mom.paragraph_format.space_after = Pt(6)
+        m_txt = getattr(mom, "formal_minutes_text", None) or (mom.get("formal_minutes_text") if isinstance(mom, dict) else str(mom))
+        mom_p = doc.add_paragraph(m_txt)
+        mom_p.paragraph_format.line_spacing = 1.15
+        mom_p.paragraph_format.space_after = Pt(12)
+
+    # 7. Complete Meeting Transcript
+    doc.add_heading("5. Transcript", level=1)
+    segments = intelligence_data.get("segments", [])
+    if segments:
+        for s in segments:
+            t_start = format_timestamp(s.get("start", 0.0))
+            t_end = format_timestamp(s.get("end", 0.0))
+            txt = s.get("text", "").strip()
+            spk = s.get("speaker")
+            spk_str = f" [{spk}]" if spk else ""
+            if txt:
+                p = doc.add_paragraph()
+                r_ts = p.add_run(f"[{t_start} - {t_end}]{spk_str}: ")
+                r_ts.font.bold = True
+                r_ts.font.size = Pt(9.0)
+                r_txt = p.add_run(txt)
+                r_txt.font.size = Pt(9.5)
+                p.paragraph_format.space_after = Pt(3)
+    elif intelligence_data.get("transcript"):
+        doc.add_paragraph(intelligence_data["transcript"])
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------
+# JSON Report Generation (Phase 6)
+# --------------------------------------------------------------------------
+
+def generate_json_report(intelligence_data: Dict[str, Any]) -> str:
+    """Generate a clean, structured JSON payload of the entire meeting intelligence."""
+    import json
+
+    def _serialize(obj):
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "__dict__"):
+            return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+        return str(obj)
+
+    clean_dict = {}
+    for k, v in intelligence_data.items():
+        if k in ("pdf_bytes", "rag_chain"):
+            continue
+        clean_dict[k] = v
+
+    return json.dumps(clean_dict, default=_serialize, indent=2, ensure_ascii=False)
+

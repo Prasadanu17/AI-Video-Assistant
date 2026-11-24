@@ -124,13 +124,16 @@ CRITICAL GROUNDING RULES:
    - If the transcript supports the answer: State the answer clearly, cite the timestamp [MM:SS] if present in the excerpt, and provide a short supporting quote.
    - State: [STATUS: CONFIRMED]
 2. NOT FOUND:
-   - If the topic is absent from the provided excerpts: State clearly that this information was not found in the recorded meeting transcript.
+   - If the topic is absent from the provided excerpts: State clearly: "I could not find this information in the transcript."
    - State: [STATUS: NOT_FOUND_COMPLETED]
 3. AMBIGUOUS OR INCOMPLETE:
    - If the evidence is partial or conflicting, explain the ambiguity.
    - State: [STATUS: AMBIGUOUS_INCOMPLETE]
-4. NO FABRICATION:
+4. MULTILINGUAL INQUIRIES:
+   - If the user asks in Hindi or Nepali (e.g., "यस बैठकमा के निर्णय गरियो?" or "मीटिंग में क्या फैसला हुआ?"), answer in English by default, while directly answering the inquiry based on the English/multilingual transcript context.
+5. NO FABRICATION:
    - Do not invent timestamps, facts, or speaker identities.
+   - If speaker labels like [Speaker 1] or [Speaker 2] exist, attribute comments to them accurately.
 
 Retrieved Transcript Excerpts:
 {context}

@@ -66,6 +66,8 @@ from core.speaker_diarizer import (
 from core.report_generator import (
     generate_pdf_report,
     generate_markdown_report,
+    generate_docx_report,
+    generate_json_report,
 )
 from core.rag_engine import build_rag_chain, ask_question
 from core.audio_recorder import (
@@ -1103,7 +1105,7 @@ def render_results(result: dict):
                 "due to high system load. Some speech may be missing."
             )
 
-        col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 1])
+        col_dl1, col_dl2, col_dl3, col_dl4, col_dl5 = st.columns(5)
         with col_dl1:
             # 1. Executive PDF Download
             pdf_bytes = result.get("pdf_bytes")
@@ -1129,14 +1131,43 @@ def render_results(result: dict):
                     pdf_bytes = b"%PDF-1.4\n%Fallback PDF\n"
 
             st.download_button(
-                "Download executive report (.pdf)",
+                "Executive PDF (.pdf)",
                 data=pdf_bytes,
                 file_name="meeting_report.pdf",
                 mime="application/pdf",
                 use_container_width=True,
             )
         with col_dl2:
-            # 2. Markdown Download
+            # 2. Word Document (.docx) Download
+            try:
+                docx_bytes = generate_docx_report({
+                    "title": result.get("title", ""),
+                    "summary": result.get("summary", ""),
+                    "action_items": result.get("structured_action_items", result.get("action_items", "")),
+                    "key_decisions": result.get("structured_key_decisions", result.get("key_decisions", "")),
+                    "minutes_of_meeting": result.get("minutes_of_meeting"),
+                    "transcript": result.get("transcript", ""),
+                    "segments": result.get("segments", []),
+                    "metadata": {
+                        "duration": f"{result.get('duration_seconds', 0.0):.1f}s" if result.get("duration_seconds") else "N/A",
+                        "language": result.get("display_language", "English"),
+                        "audio_source": st.session_state.get("source_label", "Recording"),
+                        "session_id": result.get("session_id", ""),
+                    }
+                })
+            except Exception as docx_err:
+                print(f"[!] DOCX generation error: {docx_err}")
+                docx_bytes = b""
+
+            st.download_button(
+                "Word Document (.docx)",
+                data=docx_bytes,
+                file_name="meeting_report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+        with col_dl3:
+            # 3. Markdown (.md) Download
             md_content = generate_markdown_report({
                 "title": result.get("title", ""),
                 "summary": result.get("summary", ""),
@@ -1154,19 +1185,29 @@ def render_results(result: dict):
                 }
             })
             st.download_button(
-                "Download full report (.md)",
+                "Full Report (.md)",
                 data=md_content,
                 file_name="meeting_report.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
-        with col_dl3:
-            # 3. Transcript .txt download button
+        with col_dl4:
+            # 4. JSON Payload Download
+            json_str = generate_json_report(result)
+            st.download_button(
+                "Structured Data (.json)",
+                data=json_str,
+                file_name="meeting_intelligence.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with col_dl5:
+            # 5. Transcript .txt download button
             if result.get("is_translated") or result.get("display_language") == "English":
-                txt_label = "Download transcript (.txt)"
+                txt_label = "Transcript (.txt)"
                 txt_filename = "english_transcript.txt"
             else:
-                txt_label = "Download transcript (.txt)"
+                txt_label = "Transcript (.txt)"
                 txt_filename = "transcript.txt"
 
             st.download_button(
