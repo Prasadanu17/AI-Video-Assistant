@@ -55,6 +55,14 @@ from core.extractor import (
     MeetingDecision,
     MeetingIntelligence,
 )
+from core.meeting_intelligence import (
+    ComprehensiveMeetingReport,
+    extract_hierarchical_intelligence,
+)
+from core.speaker_diarizer import (
+    diarize_segments,
+    apply_speaker_renames,
+)
 from core.report_generator import (
     generate_pdf_report,
     generate_markdown_report,
@@ -396,21 +404,61 @@ def process_live_intelligence_ui(
     t_start = time.perf_counter()
 
     with st.status("Analyzing meeting transcript...", expanded=True) as status:
-        st.write("🧠 Generating insights in parallel (Title, Summary, Action Items, Decisions, Questions)...")
-        t_llm = time.perf_counter()
-        llm_res = extract_all_insights(transcript)
-        stage_timings.update(llm_res.get("stage_timings", {}))
-        stage_timings["LLM Analysis (Parallel)"] = time.perf_counter() - t_llm
-
-        structured_actions = []
-        structured_decisions = []
-        if transcript.strip():
+        # Step 1: Optional Speaker Diarization
+        if st.session_state.get("enable_diarization", True) and segments:
             try:
-                st.write("🎯 Extracting structured action items and decisions with citations...")
-                structured_actions = extract_structured_action_items(transcript, segments=segments, max_duration=duration_seconds)
-                structured_decisions = extract_structured_decisions(transcript, segments=segments, max_duration=duration_seconds)
-            except Exception as struct_err:
-                print(f"[!] Structured extraction notice: {struct_err}")
+                st.write("👥 Identifying speaker turns across audio segments...")
+                segments = diarize_segments(
+                    audio_source,
+                    segments=segments,
+                    max_speakers=6,
+                )
+            except Exception as diar_err:
+                print(f"[!] Speaker diarization notice: {diar_err}")
+
+        # Step 2: Comprehensive Hierarchical Meeting Intelligence (Single consolidated pass)
+        st.write("🧠 Generating comprehensive meeting intelligence (Overview, Topics, Decisions, Actions, MoM)...")
+        t_llm = time.perf_counter()
+        try:
+            hierarchical_report: ComprehensiveMeetingReport = extract_hierarchical_intelligence(
+                transcript=transcript,
+                segments=segments,
+                duration_seconds=duration_seconds,
+            )
+            title = hierarchical_report.title
+            summary = hierarchical_report.detailed_meeting_summary or hierarchical_report.executive_summary
+            overview = hierarchical_report.meeting_overview
+            topics = hierarchical_report.topics_discussed
+            decisions = "\n\n".join(f"• **{d.decision}** ({d.timestamp})\n  *Rationale:* {d.rationale}" for d in hierarchical_report.key_decisions) or "No confirmed decisions."
+            action_items = "\n\n".join(f"• **{a.task}**\n  *Assignee:* {a.assignee} | *Due:* {a.deadline} | *Priority:* {a.priority} ({a.timestamp})" for a in hierarchical_report.action_items) or "No action items."
+            questions = "\n\n".join(f"• **Q:** {q.question} ({q.timestamp})\n  *A:* {q.answer}" for q in hierarchical_report.questions_and_answers) or "No questions."
+            structured_actions = hierarchical_report.action_items
+            structured_decisions = hierarchical_report.key_decisions
+            mom_data = hierarchical_report.minutes_of_meeting
+            announcements = hierarchical_report.important_announcements
+            pending_tasks = hierarchical_report.pending_tasks
+            next_steps = hierarchical_report.next_steps
+            next_meeting = hierarchical_report.next_meeting_details
+        except Exception as hier_err:
+            print(f"[!] Hierarchical intelligence fallback notice: {hier_err}")
+            # Graceful fallback to legacy extract_all_insights if needed
+            llm_res = extract_all_insights(transcript)
+            title = llm_res.get("title", "Meeting Notes")
+            summary = llm_res.get("summary", "")
+            overview = summary
+            topics = []
+            action_items = llm_res.get("action_items", "")
+            decisions = llm_res.get("key_decisions", "")
+            questions = llm_res.get("open_questions", "")
+            structured_actions = extract_structured_action_items(transcript, segments=segments, max_duration=duration_seconds)
+            structured_decisions = extract_structured_decisions(transcript, segments=segments, max_duration=duration_seconds)
+            mom_data = None
+            announcements = []
+            pending_tasks = []
+            next_steps = []
+            next_meeting = "Not mentioned in the meeting"
+
+        stage_timings["Comprehensive Meeting Intelligence"] = time.perf_counter() - t_llm
 
         rag_chain = None
         if transcript.strip():
@@ -427,12 +475,6 @@ def process_live_intelligence_ui(
         stage_timings["Total Pipeline Time"] = t_total
         if status is not None and hasattr(status, "update"):
             status.update(label=f"Done in {t_total:.1f}s", state="complete", expanded=False)
-
-    title = llm_res.get("title", "Meeting Notes")
-    summary = llm_res.get("summary", "")
-    action_items = llm_res.get("action_items", "")
-    decisions = llm_res.get("key_decisions", "")
-    questions = llm_res.get("open_questions", "")
 
     meta_info = {
         "duration": f"{duration_seconds:.1f}s" if duration_seconds else "N/A",
@@ -463,11 +505,18 @@ def process_live_intelligence_ui(
         "segments": segments,
         "title": title,
         "summary": summary,
+        "overview": overview,
+        "topics_discussed": topics,
         "action_items": action_items,
         "key_decisions": decisions,
         "open_questions": questions,
         "structured_action_items": structured_actions,
         "structured_key_decisions": structured_decisions,
+        "minutes_of_meeting": mom_data,
+        "important_announcements": announcements,
+        "pending_tasks": pending_tasks,
+        "next_steps": next_steps,
+        "next_meeting_details": next_meeting,
         "rag_chain": rag_chain,
         "session_id": session_id,
         "display_language": mode_info.get("display_name", language),
@@ -590,6 +639,13 @@ with st.sidebar:
     }
     selected_proc_mode = mode_map.get(mode_label, "balanced")
     st.session_state.processing_mode = selected_proc_mode
+
+    enable_diarization = st.sidebar.checkbox(
+        "Enable Speaker Identification (CPU)",
+        value=True,
+        help="Clusters acoustic speech turns into distinct speakers (Speaker 1, Speaker 2...) and allows manual renaming.",
+    )
+    st.session_state.enable_diarization = enable_diarization
 
     keep_original_nepali = False
     if language == "Nepali speech → English text":
@@ -964,9 +1020,80 @@ def render_results(result: dict):
             t_cols[2].metric("LLM Analysis", f"{llm_total:.2f}s")
             t_cols[3].metric("Vector Store", f"{st_timings.get('ChromaDB Indexing', 0.0):.2f}s")
 
-    tab_transcript, tab_summary, tab_notes, tab_chat = st.tabs(
-        ["Transcript", "Summary", "Action items and decisions", "Ask the video"]
+    tab_overview, tab_topics, tab_notes, tab_mom, tab_transcript, tab_chat = st.tabs(
+        ["📋 Overview & Summary", "📑 Topics Discussed", "🎯 Action Items & Decisions", "📝 Minutes of Meeting", "📜 Transcripts (Dual View)", "💬 Meeting Assistant"]
     )
+
+    with tab_overview:
+        with st.container(border=True):
+            st.subheader("Meeting Overview")
+            st.markdown(result.get("overview") or result.get("summary"))
+        with st.container(border=True):
+            st.subheader("Detailed Meeting Summary")
+            st.markdown(result["summary"])
+        if result.get("important_announcements"):
+            with st.container(border=True):
+                st.subheader("📢 Important Announcements & Updates")
+                for ann in result["important_announcements"]:
+                    st.markdown(f"• {ann}")
+        if result.get("next_steps") or result.get("next_meeting_details"):
+            col_n1, col_n2 = st.columns(2)
+            with col_n1:
+                with st.container(border=True):
+                    st.subheader("🚀 Next Steps")
+                    for ns in (result.get("next_steps") or []):
+                        st.markdown(f"• {ns}")
+            with col_n2:
+                with st.container(border=True):
+                    st.subheader("📅 Next Meeting")
+                    st.info(result.get("next_meeting_details", "Not mentioned in the meeting"))
+
+    with tab_topics:
+        topics_list = result.get("topics_discussed") or []
+        if topics_list:
+            for i, top in enumerate(topics_list, 1):
+                t_title = getattr(top, "topic_title", "Topic") if hasattr(top, "topic_title") else top.get("topic_title", "Topic")
+                t_desc = getattr(top, "topic_description", "") if hasattr(top, "topic_description") else top.get("topic_description", "")
+                t_start = getattr(top, "start_time", "00:00") if hasattr(top, "start_time") else top.get("start_time", "00:00")
+                t_end = getattr(top, "end_time", "00:00") if hasattr(top, "end_time") else top.get("end_time", "00:00")
+                with st.expander(f"📌 {i}. {t_title} `[{t_start} - {t_end}]`", expanded=(i == 1)):
+                    st.markdown(f"**Description:** {t_desc}")
+                    subtopics = getattr(top, "subtopics", []) if hasattr(top, "subtopics") else top.get("subtopics", [])
+                    if subtopics:
+                        st.markdown(f"**Subtopics:** {', '.join(subtopics)}")
+                    points = getattr(top, "important_points", []) if hasattr(top, "important_points") else top.get("important_points", [])
+                    if points:
+                        st.markdown("**Discussion Points:**")
+                        for pt in points:
+                            st.markdown(f"- {pt}")
+                    suggs = getattr(top, "suggestions", []) if hasattr(top, "suggestions") else top.get("suggestions", [])
+                    if suggs:
+                        st.markdown("**Participant Suggestions:**")
+                        for sg in suggs:
+                            st.markdown(f"- 💡 {sg}")
+                    ps_items = getattr(top, "problems_and_solutions", []) if hasattr(top, "problems_and_solutions") else top.get("problems_and_solutions", [])
+                    if ps_items:
+                        st.markdown("**Problems & Proposed Solutions:**")
+                        for ps in ps_items:
+                            p_txt = getattr(ps, "problem", "") if hasattr(ps, "problem") else ps.get("problem", "")
+                            s_txt = getattr(ps, "proposed_solution", "") if hasattr(ps, "proposed_solution") else ps.get("proposed_solution", "")
+                            st.markdown(f"- ⚠️ **Problem:** {p_txt}\n  - ✅ **Solution:** {s_txt}")
+        else:
+            st.info("No distinct topic breakdown was generated for this session.")
+
+    with tab_mom:
+        mom_sec = result.get("minutes_of_meeting")
+        if mom_sec:
+            m_type = getattr(mom_sec, "meeting_type", "General") if hasattr(mom_sec, "meeting_type") else mom_sec.get("meeting_type", "General")
+            m_chair = getattr(mom_sec, "chair_or_facilitator", "Unknown") if hasattr(mom_sec, "chair_or_facilitator") else mom_sec.get("chair_or_facilitator", "Unknown")
+            m_attendees = getattr(mom_sec, "attendees_mentioned", []) if hasattr(mom_sec, "attendees_mentioned") else mom_sec.get("attendees_mentioned", [])
+            m_text = getattr(mom_sec, "formal_minutes_text", "") if hasattr(mom_sec, "formal_minutes_text") else mom_sec.get("formal_minutes_text", "")
+            with st.container(border=True):
+                st.subheader(f"Minutes of Meeting (MoM) — {m_type}")
+                st.caption(f"👤 **Facilitator:** {m_chair} &nbsp;|&nbsp; 👥 **Attendees Recorded:** {', '.join(m_attendees) if m_attendees else 'Not explicitly stated'}")
+                st.markdown(m_text)
+        else:
+            st.info("Formal Minutes of Meeting will appear here once generated.")
 
     with tab_transcript:
         if result.get("dropped_chunks_count", 0) > 0:
@@ -1068,14 +1195,12 @@ def render_results(result: dict):
                     t_start = format_timestamp(seg.get("start", 0.0))
                     t_end = format_timestamp(seg.get("end", 0.0))
                     seg_text = seg.get("text", "").strip()
+                    spk = seg.get("speaker")
+                    spk_badge = f"`[{spk}]` " if spk else ""
                     if seg_text:
-                        st.markdown(f"**`[{t_start} - {t_end}]`** {seg_text}")
+                        st.markdown(f"**`[{t_start} - {t_end}]`** {spk_badge}{seg_text}")
             else:
                 st.write(result["transcript"])
-
-    with tab_summary:
-        with st.container(border=True):
-            st.markdown(result["summary"])
 
     with tab_notes:
         col_a, col_b = st.columns(2, gap="medium")
