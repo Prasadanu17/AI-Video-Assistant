@@ -167,28 +167,38 @@ def verify_and_align_citation(
     """
     Validates that candidate evidence actually exists in the transcript segments
     and that candidate timestamps are valid and within bounds.
-    Returns: (verified_timestamp_str, verified_evidence_quote)
+    STRICT ACCURACY ENFORCEMENT:
+    - Never accepts fabricated timestamps that exceed the actual meeting duration.
+    - If a candidate timestamp is beyond max_duration or missing, it searches actual segments for proof.
+    - If no segment supports the claim, rejects the hallucinated timestamp and returns ("Not specified", "").
     """
     if not segments:
-        ts = candidate_timestamp if candidate_timestamp and candidate_timestamp != "Not specified" else "00:00"
-        return ts, evidence_quote
+        return "Not specified", ""
+
+    # Calculate actual meeting audio upper bound from segments
+    max_seg_end = max((s.get("end", 0.0) for s in segments), default=0.0)
+    effective_max = max(max_seg_end, max_duration or 0.0)
 
     clean_quote = (evidence_quote or "").strip().lower()
     clean_claim = (claim_text or "").strip().lower()
 
-    # 1. First search for direct quote match in segments
-    if clean_quote and len(clean_quote) > 8:
+    # 1. Search for direct quote match in actual segments
+    if clean_quote and len(clean_quote) > 6:
         for s in segments:
             seg_txt = s.get("text", "").strip()
             if clean_quote in seg_txt.lower() or seg_txt.lower() in clean_quote:
                 s_start = s.get("start", 0.0)
                 s_end = s.get("end", 0.0)
-                return f"{format_timestamp(s_start)} - {format_timestamp(s_end)}", seg_txt
+                if effective_max <= 0 or s_start <= (effective_max + 2.0):
+                    return f"{format_timestamp(s_start)} - {format_timestamp(s_end)}", seg_txt
 
-    # 2. Check candidate timestamp
+    # 2. Check candidate timestamp if within actual meeting duration
     if candidate_timestamp and candidate_timestamp != "Not specified":
         start_sec, end_sec = parse_timestamp_range(candidate_timestamp)
-        if max_duration is None or start_sec <= (max_duration + 2.0):
+        # REJECT any timestamp that exceeds actual audio duration!
+        if effective_max > 0 and start_sec > (effective_max + 2.0):
+            print(f"[!] Grounding rejection: Timestamp '{candidate_timestamp}' exceeds audio duration ({effective_max:.1f}s). Discarding hallucinated timestamp.")
+        else:
             for s in segments:
                 s_start = s.get("start", 0.0)
                 s_end = s.get("end", 0.0)
@@ -196,7 +206,7 @@ def verify_and_align_citation(
                     seg_txt = s.get("text", "").strip()
                     return f"{format_timestamp(s_start)} - {format_timestamp(s_end)}", seg_txt
 
-    # 3. Fuzzy lexical word overlap search against segments
+    # 3. Fuzzy lexical word overlap search against actual segments
     claim_words = set(re.findall(r"\w{3,}", clean_claim))
     if claim_words:
         best_seg = None
@@ -211,11 +221,11 @@ def verify_and_align_citation(
         if best_seg and best_overlap >= 2:
             s_start = best_seg.get("start", 0.0)
             s_end = best_seg.get("end", 0.0)
-            return f"{format_timestamp(s_start)} - {format_timestamp(s_end)}", best_seg.get("text", "").strip()
+            if effective_max <= 0 or s_start <= (effective_max + 2.0):
+                return f"{format_timestamp(s_start)} - {format_timestamp(s_end)}", best_seg.get("text", "").strip()
 
-    # Fallback if no specific segment was validated
-    ts = candidate_timestamp if (candidate_timestamp and candidate_timestamp != "Not specified") else "00:00"
-    return ts, evidence_quote or "Not specified in transcript"
+    # Reject unsupported claims rather than silently fabricating
+    return "Not specified", ""
 
 
 # --------------------------------------------------------------------------
@@ -429,8 +439,19 @@ def extract_hierarchical_intelligence(
         print(f"[*] Processing long meeting transcript ({len(annotated_transcript)} chars) via hierarchical chunking...")
         report = _hierarchical_long_meeting_extraction(annotated_transcript, segments, duration_seconds, llm)
 
-    # Post-process: Verify all decisions and action items against transcript segments
+    # Post-process: Verify all topics, decisions and action items against actual transcript segments
     if segments:
+        max_audio_time = max((s.get("end", 0.0) for s in segments), default=duration_seconds)
+        # 1. Clamp and validate topic timestamps
+        for top in report.topics_discussed:
+            start_s, _ = parse_timestamp_range(top.start_time)
+            end_s, _ = parse_timestamp_range(top.end_time)
+            if max_audio_time > 0 and start_s > max_audio_time:
+                top.start_time = "00:00"
+            if max_audio_time > 0 and end_s > max_audio_time:
+                top.end_time = format_timestamp(max_audio_time)
+
+        # 2. Strict citation verification for action items and decisions
         for item in report.action_items:
             item.timestamp, item.evidence_quote = verify_and_align_citation(
                 claim_text=item.task,

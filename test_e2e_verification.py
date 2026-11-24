@@ -15,6 +15,7 @@ load_dotenv()
 from core.transcriber import transcribe_all, set_processing_mode, get_processing_mode
 from core.speaker_diarizer import diarize_segments
 from core.meeting_intelligence import extract_hierarchical_intelligence
+from core.meeting_qa import format_timestamp
 
 audio_path = "test_slice_30s.wav"
 
@@ -61,30 +62,16 @@ for s in diar_segs[:3]:
     print(f"     [{s.get('start', 0.0):.1f}s - {s.get('end', 0.0):.1f}s] {s.get('speaker')}: {s.get('text', '')[:40]}...")
 
 # 3. Comprehensive Meeting Intelligence
-print("\n[Step 3] Running Hierarchical Meeting Intelligence Extraction...")
-test_meeting_transcript = (
-    "[00:00 - 05:00] Speaker 1: Welcome everyone. In this sprint review, we need to address our high backend latency. "
-    "Our API response time increased by 40% during peak traffic.\n"
-    "[05:01 - 10:00] Speaker 2: I investigated the issue and found that SQLite is locking on concurrent writes. "
-    "I propose migrating our primary database to PostgreSQL.\n"
-    "[10:01 - 15:00] Speaker 1: That is a solid plan. Let's officially decide to migrate to PostgreSQL on RDS. "
-    "John, can you prepare the database staging environment by Friday 5 PM?\n"
-    "[15:01 - 20:00] Speaker 2: Yes, I will deliver the PostgreSQL staging environment by Friday 5 PM. "
-    "Also, reminder that next week's all-hands meeting is postponed to Tuesday.\n"
-    "[20:01 - 25:00] Speaker 1: Great. Let's schedule our next sync for Monday at 10 AM. Meeting adjourned."
-)
+print("\n[Step 3] Running Hierarchical Meeting Intelligence Extraction directly on real audio segments...")
+# We use the actual segments produced by Step 1 & 2 on the real audio file!
+actual_audio_duration = max((s.get("end", 0.0) for s in diar_segs), default=30.0)
+real_transcript = " ".join(f"[{format_timestamp(s.get('start', 0.0))} - {format_timestamp(s.get('end', 0.0))}] {s.get('speaker', 'Speaker 1')}: {s.get('text', '')}" for s in diar_segs)
 
 t_intel0 = time.perf_counter()
 report = extract_hierarchical_intelligence(
-    transcript=test_meeting_transcript,
-    segments=[
-        {"start": 0.0, "end": 300.0, "speaker": "Speaker 1", "text": "Welcome everyone. In this sprint review, we need to address our high backend latency."},
-        {"start": 301.0, "end": 600.0, "speaker": "Speaker 2", "text": "I investigated the issue and found that SQLite is locking on concurrent writes. I propose migrating our primary database to PostgreSQL."},
-        {"start": 601.0, "end": 900.0, "speaker": "Speaker 1", "text": "That is a solid plan. Let's officially decide to migrate to PostgreSQL on RDS. John, can you prepare the database staging environment by Friday 5 PM?"},
-        {"start": 901.0, "end": 1200.0, "speaker": "Speaker 2", "text": "Yes, I will deliver the PostgreSQL staging environment by Friday 5 PM. Also, reminder that next week's all-hands meeting is postponed to Tuesday."},
-        {"start": 1201.0, "end": 1500.0, "speaker": "Speaker 1", "text": "Great. Let's schedule our next sync for Monday at 10 AM. Meeting adjourned."},
-    ],
-    duration_seconds=1500.0,
+    transcript=real_transcript,
+    segments=diar_segs,
+    duration_seconds=actual_audio_duration,
 )
 t_intel = time.perf_counter() - t_intel0
 
