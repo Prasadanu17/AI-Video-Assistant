@@ -69,7 +69,9 @@ class TestPhase2TranscriptionOptimization(unittest.TestCase):
 
         # Reset singleton cache for test
         old_faster = t_mod._faster_model
+        old_registry = dict(t_mod._faster_model_registry)
         try:
+            t_mod._faster_model_registry.clear()
             mock_fw_instance = MagicMock()
             mock_fw_class = MagicMock(return_value=mock_fw_instance)
 
@@ -89,6 +91,8 @@ class TestPhase2TranscriptionOptimization(unittest.TestCase):
                 self.assertEqual(mock_fw_class.call_count, 1)
         finally:
             t_mod._faster_model = old_faster
+            t_mod._faster_model_registry.clear()
+            t_mod._faster_model_registry.update(old_registry)
 
     def test_03_faster_whisper_tuple_transcription_and_timestamps(self):
         """Verify parsing of faster-whisper (segments, info) tuple output with timestamps."""

@@ -413,7 +413,8 @@ class TestLiveTranscriptionRealModel:
         from core.transcriber import transcribe_chunk
         empty_arr = np.zeros(0, dtype=np.float32)
         res_empty = transcribe_chunk(empty_arr, language="en", return_segments=True)
-        assert res_empty == {"text": "", "segments": []}
+        assert res_empty.get("text") == ""
+        assert res_empty.get("segments") == []
 
         with pytest.raises(TypeError):
             transcribe_chunk(12345, language="en")

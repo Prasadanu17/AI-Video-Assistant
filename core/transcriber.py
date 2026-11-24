@@ -37,13 +37,198 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 SARVAM_STT_TRANSLATE_URL = "https://api.sarvam.ai/speech-to-text-translate"
 SARVAM_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v2.5")
 
+# --------------------------------------------------------------------------
+# Processing Modes & Engine Presets (Phase 1)
+# --------------------------------------------------------------------------
+PROCESSING_MODES = {
+    "fast": {
+        "model_name": os.getenv("WHISPER_FAST_MODEL", "tiny"),
+        "beam_size": 1,
+        "vad_threshold": 0.40,
+        "description": "Fast Mode: Lightweight multilingual model (tiny) prioritizing minimum CPU latency.",
+    },
+    "balanced": {
+        "model_name": os.getenv("WHISPER_BALANCED_MODEL", "small"),
+        "beam_size": 1,
+        "vad_threshold": 0.35,
+        "description": "Balanced Mode: Standard multilingual model (small) balancing speed and accuracy.",
+    },
+    "high_accuracy": {
+        "model_name": os.getenv("WHISPER_ACCURATE_MODEL", "medium"),
+        "beam_size": 3,
+        "vad_threshold": 0.30,
+        "description": "High Accuracy Mode: High-capacity model (medium) for complex accents, jargon, and code-switching.",
+    },
+}
+
+_current_processing_mode = os.getenv("PROCESSING_MODE", "balanced").strip().lower()
+if _current_processing_mode not in PROCESSING_MODES:
+    _current_processing_mode = "balanced"
+
 _model = None
 _faster_model = None
-_openai_model = None
-_model_lock = threading.Lock()
+_faster_model_registry = {}
+_openai_model_registry = {}
+_model_lock = threading.RLock()
+
+
+def unload_all_models():
+    """Unload all cached models from memory to free RAM."""
+    global _faster_model_registry, _openai_model_registry, _model, _faster_model
+    with _model_lock:
+        _faster_model_registry.clear()
+        _openai_model_registry.clear()
+        _faster_model = None
+        _model = None
+    import gc
+    gc.collect()
+
+
+def get_processing_mode() -> str:
+    """Return the active processing mode ('fast', 'balanced', or 'high_accuracy')."""
+    return _current_processing_mode
+
+
+def set_processing_mode(mode: str) -> str:
+    """Set the active processing mode ('fast', 'balanced', or 'high_accuracy')."""
+    global _current_processing_mode
+    m = str(mode).strip().lower().replace(" ", "_").replace("-", "_")
+    if m in PROCESSING_MODES:
+        _current_processing_mode = m
+        print(f"[Transcriber] Switched processing mode to '{m}' (model: {PROCESSING_MODES[m]['model_name']}).")
+    else:
+        print(f"[!] Unknown processing mode '{mode}'. Preserving '{_current_processing_mode}'.")
+    return _current_processing_mode
+
+
+def get_active_model_name(mode: str = None) -> str:
+    """Return model name for the specified or current processing mode."""
+    m = (mode or _current_processing_mode).strip().lower().replace(" ", "_").replace("-", "_")
+    cfg = PROCESSING_MODES.get(m, PROCESSING_MODES["balanced"])
+    return cfg["model_name"]
+
+
+# --------------------------------------------------------------------------
+# Multilingual Lexical Markers for Contextual Language Detection (Phase 2)
+# --------------------------------------------------------------------------
+NEPALI_LEXICAL_MARKERS = {
+    "छ", "छन्", "छैन", "थियो", "थिए", "भयो", "भने", "भनेर", "गर्यो", "गरेको",
+    "गर्नुहोस्", "हुनुहुन्छ", "तर", "लाई", "मा", "बाट", "सँग", "पनि", "गर्छु",
+    "हुँदैन", "हुन्छ", "भएको", "गर्ने", "गर्नेछ", "रहेको", "धेरै", "अलि", "कस्तो",
+    "हामी", "तपाईं", "तिमी", "उनी", "यस", "त्यस", "कुरा", "काम", "समय", "नेपाल",
+    "धन्यवाद", "राम्रो", "हो", "होइन", "के", "कसरी", "कहिले", "कहाँ"
+}
+
+HINDI_LEXICAL_MARKERS = {
+    "है", "हैं", "था", "थी", "थे", "हुआ", "किया", "कीजिए", "होगा", "होंगे",
+    "लेकिन", "को", "में", "से", "भी", "करता", "करेंगे", "नहीं", "सकता", "सकते",
+    "गया", "गए", "गई", "वाले", "बात", "आप", "हम", "यह", "वह", "इस", "उस",
+    "समय", "काम", "बहुत", "भारत", "चाहिए", "धन्यवाद", "अच्छा", "हाँ", "क्या"
+}
+
+
+def analyze_segment_language(text: str, whisper_code: str = None, prob: float = 0.0) -> dict:
+    """
+    Contextual language detection distinguishing English, Hindi, Nepali, and code-switching.
+    Works at segment boundaries to avoid misidentifying short technical terms or proper nouns.
+    """
+    import re
+    if not text or not text.strip():
+        return {
+            "primary_code": whisper_code or "en",
+            "display_name": "English",
+            "is_code_switched": False,
+            "script": "Latin",
+        }
+
+    clean_text = text.strip()
+    devanagari_chars = len(re.findall(r"[\u0900-\u097F]", clean_text))
+    latin_chars = len(re.findall(r"[a-zA-Z]", clean_text))
+    total_alpha = devanagari_chars + latin_chars
+
+    clean_words = set(re.findall(r"[\w\u0900-\u097F]+", clean_text.lower()))
+    nepali_hits = len(clean_words & NEPALI_LEXICAL_MARKERS)
+    hindi_hits = len(clean_words & HINDI_LEXICAL_MARKERS)
+
+    has_devanagari = devanagari_chars > 0
+    has_latin = latin_chars > 0
+
+    # 1. Code-switching detection (substantial presence of both Latin and Devanagari)
+    if has_devanagari and has_latin and total_alpha > 0:
+        deva_ratio = devanagari_chars / total_alpha
+        latin_ratio = latin_chars / total_alpha
+        if deva_ratio > 0.12 and latin_ratio > 0.12:
+            if nepali_hits >= hindi_hits and nepali_hits > 0:
+                return {
+                    "primary_code": "en+ne",
+                    "display_name": "English + Nepali",
+                    "is_code_switched": True,
+                    "script": "Mixed",
+                }
+            elif hindi_hits > nepali_hits:
+                return {
+                    "primary_code": "en+hi",
+                    "display_name": "English + Hindi",
+                    "is_code_switched": True,
+                    "script": "Mixed",
+                }
+            else:
+                return {
+                    "primary_code": "multilingual",
+                    "display_name": "Multilingual (Code-Switching)",
+                    "is_code_switched": True,
+                    "script": "Mixed",
+                }
+
+    # 2. Devanagari script evaluation (Nepali vs Hindi)
+    if has_devanagari:
+        if nepali_hits > hindi_hits:
+            code = "ne"
+            name = "Nepali (Devanagari)"
+        elif hindi_hits > nepali_hits:
+            code = "hi"
+            name = "Hindi"
+        else:
+            if whisper_code in ("ne", "hi"):
+                code = whisper_code
+                name = "Nepali (Devanagari)" if code == "ne" else "Hindi"
+            else:
+                code = "ne" if nepali_hits > 0 else "hi"
+                name = "Nepali (Devanagari)" if code == "ne" else "Hindi"
+
+        return {
+            "primary_code": code,
+            "display_name": name,
+            "is_code_switched": False,
+            "script": "Devanagari",
+        }
+
+    # 3. Pure Latin / English
+    return {
+        "primary_code": "en",
+        "display_name": "English",
+        "is_code_switched": False,
+        "script": "Latin",
+    }
+
 
 # Comprehensive Language Mapping & Alias Normalization
 LANGUAGE_CONFIG = {
+    # Default Automatic Language Detection (Recommended default for all meetings)
+    "auto": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect (English, Hindi, Nepali, Mixed)"},
+    "auto-detect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect (English, Hindi, Nepali, Mixed)"},
+    "autodetect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect (English, Hindi, Nepali, Mixed)"},
+    "automatic language detection": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect (English, Hindi, Nepali, Mixed)"},
+
+    # Multilingual & Code-Switching
+    "multilingual": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Multilingual (Code-Switching)"},
+    "code-switching": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Multilingual (Code-Switching)"},
+    "mixed": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Multilingual (Code-Switching)"},
+    "en+ne": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "English + Nepali"},
+    "en+hi": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "English + Hindi"},
+    "hi+ne": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Hindi + Nepali"},
+    "en+hi+ne": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "English + Hindi + Nepali"},
+
     # English
     "english": {"engine": "whisper", "whisper_code": "en", "default_task": "transcribe", "display_name": "English"},
     "english transcription": {"engine": "whisper", "whisper_code": "en", "default_task": "transcribe", "display_name": "English"},
@@ -67,12 +252,6 @@ LANGUAGE_CONFIG = {
     "ne-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
     "ne-to-en": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
     "nepali_translate": {"engine": "whisper", "whisper_code": "ne", "default_task": "translate", "display_name": "Nepali -> English Translation"},
-
-    # Auto-detection
-    "auto": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
-    "auto-detect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
-    "autodetect": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
-    "automatic language detection": {"engine": "whisper", "whisper_code": None, "default_task": "transcribe", "display_name": "Auto-Detect"},
 
     # Hinglish (Sarvam AI cloud translation)
     "hinglish": {"engine": "sarvam", "whisper_code": None, "default_task": "transcribe", "display_name": "Hinglish (Sarvam AI)"},
@@ -197,53 +376,53 @@ def get_device_and_compute():
 
 
 def load_faster_whisper_model(model_name: str = None):
-    """Load and cache the faster-whisper model (thread-safe singleton)."""
-    global _faster_model
-    target_model = model_name or WHISPER_MODEL
+    """Load and cache the faster-whisper model (thread-safe multi-model singleton registry)."""
+    global _faster_model_registry, _faster_model
+    target_model = model_name or get_active_model_name()
     with _model_lock:
-        if _faster_model is None:
+        if target_model not in _faster_model_registry:
             from faster_whisper import WhisperModel
             device, compute_type = get_device_and_compute()
             cpu_threads = min(os.cpu_count() or 4, 8)
             print(f"Loading faster-whisper model '{target_model}' on {device} ({compute_type}, {cpu_threads} threads)...")
-            _faster_model = WhisperModel(
+            instance = WhisperModel(
                 target_model,
                 device=device,
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
             )
+            _faster_model_registry[target_model] = instance
+            _faster_model = instance
             print(f"faster-whisper model '{target_model}' loaded successfully.")
-    return _faster_model
+    return _faster_model_registry[target_model]
 
 
 def load_openai_whisper_model(model_name: str = None):
-    """Load and cache the fallback OpenAI Whisper model (thread-safe singleton)."""
-    global _openai_model
-    target_model = model_name or WHISPER_MODEL
+    """Load and cache the fallback OpenAI Whisper model (thread-safe multi-model singleton registry)."""
+    global _openai_model_registry
+    target_model = model_name or get_active_model_name()
     with _model_lock:
-        if _openai_model is None:
+        if target_model not in _openai_model_registry:
             print(f"Loading fallback OpenAI Whisper model: {target_model} ...")
-            _openai_model = whisper.load_model(target_model)
-            print("OpenAI Whisper model loaded.")
-    return _openai_model
+            _openai_model_registry[target_model] = whisper.load_model(target_model)
+            print(f"OpenAI Whisper model '{target_model}' loaded.")
+    return _openai_model_registry[target_model]
 
 
-def load_model():
+def load_model(model_name: str = None, processing_mode: str = None):
     """
-    Load and cache the active local Whisper model.
+    Load and cache the active local Whisper model for current processing mode or target model.
     Prioritizes faster-whisper with INT8 CPU or float16 GPU acceleration,
     falling back to standard openai-whisper if faster-whisper is unavailable.
     """
-    global _model
+    target = model_name or get_active_model_name(processing_mode)
     use_faster = os.getenv("USE_FASTER_WHISPER", "true").strip().lower() in ("1", "true", "yes")
     if use_faster:
         try:
-            _model = load_faster_whisper_model()
-            return _model
+            return load_faster_whisper_model(target)
         except Exception as e:
             print(f"[!] Warning: Failed to load faster-whisper ({e}). Falling back to OpenAI Whisper.")
-    _model = load_openai_whisper_model()
-    return _model
+    return load_openai_whisper_model(target)
 
 
 def transcribe_chunk_whisper(
@@ -252,27 +431,31 @@ def transcribe_chunk_whisper(
     task: str = "transcribe",
     return_segments: bool = False,
     initial_prompt: str = None,
+    processing_mode: str = None,
 ) -> str | dict:
     """
     Transcribe or translate an audio chunk using faster-whisper or fallback Whisper.
+    Supports Fast, Balanced, and High Accuracy processing modes, dynamic language detection,
+    and dual verbatim + English translation generation.
     
     Args:
         chunk_path: Path to the WAV audio chunk, or 1D float32 NumPy audio array.
         language: Whisper language code ('en', 'hi', 'ne', or None for auto-detect).
-        task: 'transcribe' (default) or 'translate' (translates to English).
+        task: 'transcribe' (default), 'translate' (translates to English), or 'auto' (dual stream).
         return_segments: Whether to return full segments with timestamps.
         initial_prompt: Optional context prompt to prime continuous vocabulary and grammar.
+        processing_mode: 'fast' (tiny), 'balanced' (small), or 'high_accuracy' (medium).
     """
     if isinstance(chunk_path, np.ndarray):
         if chunk_path.size == 0:
             print("[!] Warning: Audio chunk numpy array is empty. Skipping.")
-            return {"text": "", "segments": []} if return_segments else ""
+            return {"text": "", "original_text": "", "english_text": "", "segments": []} if return_segments else ""
     elif isinstance(chunk_path, str):
         if not os.path.exists(chunk_path):
             raise FileNotFoundError(f"Audio chunk file not found: {chunk_path}")
         if os.path.getsize(chunk_path) == 0:
             print(f"[!] Warning: Audio chunk {chunk_path} is 0 bytes. Skipping.")
-            return {"text": "", "segments": []} if return_segments else ""
+            return {"text": "", "original_text": "", "english_text": "", "segments": []} if return_segments else ""
     else:
         raise TypeError(f"chunk_path must be a file path string or numpy array, got {type(chunk_path)}")
 
@@ -287,22 +470,27 @@ def transcribe_chunk_whisper(
         except Exception:
             pass
 
-    model = load_model()
+    active_mode = (processing_mode or get_processing_mode()).strip().lower()
+    mode_spec = PROCESSING_MODES.get(active_mode, PROCESSING_MODES["balanced"])
+
+    model = load_model(model_name=mode_spec["model_name"])
     validate_whisper_model(model, language=resolved_lang, task=resolved_task)
 
-    transcribe_kwargs = {"task": resolved_task}
+    transcribe_kwargs = {"task": resolved_task if resolved_task != "auto" else "transcribe"}
     if resolved_lang is not None:
         transcribe_kwargs["language"] = resolved_lang
 
     # Configure beam size and robust decoding parameters for faster-whisper
     if type(model).__name__ == "WhisperModel":
-        transcribe_kwargs["beam_size"] = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+        env_beam = os.getenv("WHISPER_BEAM_SIZE")
+        transcribe_kwargs["beam_size"] = int(env_beam) if env_beam else mode_spec.get("beam_size", 1)
         transcribe_kwargs["condition_on_previous_text"] = False
         use_vad = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() in ("1", "true", "yes")
         if use_vad:
             transcribe_kwargs["vad_filter"] = True
+            vad_thresh = float(os.getenv("WHISPER_VAD_THRESHOLD", str(mode_spec.get("vad_threshold", 0.35))))
             transcribe_kwargs["vad_parameters"] = dict(
-                threshold=float(os.getenv("WHISPER_VAD_THRESHOLD", "0.35")),
+                threshold=vad_thresh,
                 min_silence_duration_ms=int(os.getenv("WHISPER_MIN_SILENCE_MS", "400")),
                 speech_pad_ms=int(os.getenv("WHISPER_SPEECH_PAD_MS", "250")),
             )
@@ -359,22 +547,93 @@ def transcribe_chunk_whisper(
                     "text": seg_text,
                 })
             text = " ".join(text_parts).strip()
+
+            detected_code = getattr(info, "language", resolved_lang or "en")
+            prob = float(getattr(info, "language_probability", 1.0))
+            lang_analysis = analyze_segment_language(text, whisper_code=detected_code, prob=prob)
+
+            original_text = text
+            english_text = text
+
+            # Dynamic dual translation: If non-English detected and task is auto or translate
+            needs_translation = (
+                lang_analysis["primary_code"] not in ("en",)
+                or lang_analysis["is_code_switched"]
+                or resolved_task == "translate"
+            )
+
+            if needs_translation and text and resolved_task != "transcribe":
+                # Translate chunk into English
+                tr_kwargs = dict(transcribe_kwargs)
+                tr_kwargs["task"] = "translate"
+                if resolved_lang:
+                    tr_kwargs["language"] = resolved_lang
+                try:
+                    raw_tr = model.transcribe(chunk_path, **tr_kwargs)
+                    if isinstance(raw_tr, tuple) and len(raw_tr) == 2:
+                        tr_segs = list(raw_tr[0])
+                        tr_txt = " ".join(s.text.strip() for s in tr_segs if s.text.strip()).strip()
+                        if tr_txt:
+                            english_text = tr_txt
+                        # Align segment-level english text if segment count matches
+                        if len(tr_segs) == len(segments):
+                            for idx, s in enumerate(segments):
+                                s["english_text"] = tr_segs[idx].text.strip()
+                        elif tr_segs:
+                            # Map full translation across segments
+                            for s in segments:
+                                s["english_text"] = english_text
+                except Exception as tr_err:
+                    print(f"[!] Translation pass notice: {tr_err}")
+                    english_text = original_text
+
             if return_segments:
-                return {"text": text, "segments": segments}
-            return text
+                primary_text = english_text if resolved_task == "translate" else original_text
+                return {
+                    "text": primary_text,
+                    "original_text": original_text,
+                    "english_text": english_text,
+                    "detected_language": lang_analysis["display_name"],
+                    "language_code": lang_analysis["primary_code"],
+                    "is_code_switched": lang_analysis["is_code_switched"],
+                    "segments": segments,
+                }
+            return english_text if resolved_task == "translate" else original_text
 
         # 2. OpenAI Whisper / Mock dict format: {"text": "...", "segments": [...]}
         if isinstance(raw_result, dict):
             text = raw_result.get("text", "").strip()
             if return_segments:
-                return {"text": text, "segments": raw_result.get("segments", [])}
+                return {
+                    "text": text,
+                    "original_text": text,
+                    "english_text": text,
+                    "detected_language": "Auto",
+                    "language_code": "en",
+                    "is_code_switched": False,
+                    "segments": raw_result.get("segments", []),
+                }
             return text
 
         # 3. String format
         text = str(raw_result).strip()
         if return_segments:
-            return {"text": text, "segments": []}
+            return {
+                "text": text,
+                "original_text": text,
+                "english_text": text,
+                "detected_language": "Auto",
+                "language_code": "en",
+                "is_code_switched": False,
+                "segments": [],
+            }
         return text
+
+    except Exception as e:
+        print(f"[!] Error during Whisper transcription for {chunk_path}: {e}")
+        if return_segments:
+            return {"text": "", "original_text": "", "english_text": "", "segments": []}
+        return ""
 
     except Exception as e:
         print(f"[!] Error during Whisper transcription for {chunk_path}: {e}")
@@ -444,20 +703,29 @@ def transcribe_chunk_sarvam(chunk_path: str) -> str:
 
 def transcribe_chunk(
     chunk_path: str | np.ndarray,
-    language: str = "english",
+    language: str = "auto",
     task: str = None,
     return_segments: bool = False,
     initial_prompt: str = None,
+    processing_mode: str = None,
 ) -> str | dict:
     """
     Route one chunk to Whisper or Sarvam depending on the language/mode configuration.
+    Supports processing mode selection ('fast', 'balanced', 'high_accuracy').
     """
     cfg = resolve_language_mode(language=language, task=task)
     if cfg["engine"] == "sarvam":
         if isinstance(chunk_path, np.ndarray):
             raise NotImplementedError("Sarvam API requires WAV file path, not in-memory numpy array.")
         text = transcribe_chunk_sarvam(chunk_path)
-        return {"text": text, "segments": []} if return_segments else text
+        return {
+            "text": text,
+            "original_text": text,
+            "english_text": text,
+            "detected_language": "Hinglish (Sarvam)",
+            "language_code": "hi",
+            "segments": [],
+        } if return_segments else text
 
     return transcribe_chunk_whisper(
         chunk_path,
@@ -465,41 +733,56 @@ def transcribe_chunk(
         task=cfg["task"],
         return_segments=return_segments,
         initial_prompt=initial_prompt,
+        processing_mode=processing_mode,
     )
 
 
 def transcribe_all(
     chunks: list,
-    language: str = "english",
+    language: str = "auto",
     task: str = None,
-    return_original: bool = False,
+    return_original: bool = True,
     chunk_duration_seconds: float = 180.0,
     progress_callback = None,
+    processing_mode: str = None,
 ) -> str | dict:
     """
-    Transcribe all audio chunks sequentially with the specified language mode and task.
+    Transcribe all audio chunks sequentially with dynamic multilingual detection,
+    code-switching support, and aligned dual transcripts (verbatim original + English translation).
 
     Args:
         chunks: List of WAV chunk file paths.
-        language: Language name or mode key.
+        language: Language name or mode key (defaults to 'auto' for automatic language detection).
         task: Explicit task ('transcribe' or 'translate').
-        return_original: If True and translating from Nepali, also generates original Devanagari transcript.
+        return_original: If True, returns full dict with English transcript, original transcript, and segments.
         chunk_duration_seconds: Estimated duration per chunk for timestamp offsets.
         progress_callback: Optional callable(current_chunk_idx, total_chunks, message) for UI progress indicators.
+        processing_mode: Processing preset ('fast', 'balanced', or 'high_accuracy').
 
     Returns:
         str if return_original is False;
-        dict with {"transcript", "original_transcript", "segments"} if return_original is True.
+        dict with {"transcript", "original_transcript", "segments", "display_language", ...} if return_original is True.
     """
     import time
     t_start = time.perf_counter()
     if not chunks:
         print("[!] No audio chunks provided to transcribe.")
         if return_original:
-            return {"transcript": "", "original_transcript": "", "segments": []}
+            return {
+                "transcript": "",
+                "original_transcript": "",
+                "segments": [],
+                "display_language": "Auto-Detect",
+                "is_translated": False,
+                "transcription_time": 0.0,
+            }
         return ""
 
+    if isinstance(chunks, str):
+        chunks = [chunks]
+
     cfg = resolve_language_mode(language=language, task=task)
+    active_mode = (processing_mode or get_processing_mode()).strip().lower()
 
     if cfg["engine"] == "sarvam":
         print(f"Using Sarvam AI for transcription ({cfg['display_name']}).")
@@ -507,19 +790,19 @@ def transcribe_all(
         lang_label = cfg["whisper_code"] if cfg["whisper_code"] else "auto"
         print(
             f"Using Whisper for {cfg['display_name']} "
-            f"(code: '{lang_label}', task: '{cfg['task']}')."
+            f"(code: '{lang_label}', task: '{cfg['task']}', mode: '{active_mode}')."
         )
 
-    full_transcript = ""
-    original_transcript = "" if return_original else None
+    full_english = []
+    full_original = []
     all_segments = []
-
-    is_translating_nepali = (cfg["whisper_code"] == "ne" and cfg["task"] == "translate")
+    detected_languages = []
+    any_translated = False
 
     total_chunks = len(chunks)
     for i, chunk in enumerate(chunks):
         t_chunk_start = time.perf_counter()
-        msg = f"Transcribing chunk {i + 1}/{total_chunks}..."
+        msg = f"Transcribing chunk {i + 1}/{total_chunks} ({active_mode} mode)..."
         print(f"[*] {msg}")
         if progress_callback:
             try:
@@ -529,46 +812,72 @@ def transcribe_all(
 
         chunk_offset = i * chunk_duration_seconds
 
-        # 1. Primary pass (Translation or Transcription)
-        res = transcribe_chunk(chunk, language=language, task=task, return_segments=True)
-        text = res["text"] if isinstance(res, dict) else str(res)
-        segments = res.get("segments", []) if isinstance(res, dict) else []
+        res = transcribe_chunk(
+            chunk,
+            language=language,
+            task=task,
+            return_segments=True,
+            processing_mode=active_mode,
+        )
 
-        if text and text.strip():
-            full_transcript += text.strip() + " "
+        if isinstance(res, dict):
+            orig_txt = res.get("original_text", res.get("text", "")).strip()
+            eng_txt = res.get("english_text", res.get("text", "")).strip()
+            det_lang = res.get("detected_language", cfg["display_name"])
+            segs = res.get("segments", [])
+            if res.get("is_code_switched") or (orig_txt != eng_txt):
+                any_translated = True
+        else:
+            orig_txt = str(res).strip()
+            eng_txt = orig_txt
+            det_lang = cfg["display_name"]
+            segs = []
 
-        for seg in segments:
+        if det_lang and det_lang not in detected_languages:
+            detected_languages.append(det_lang)
+
+        if orig_txt:
+            full_original.append(orig_txt)
+        if eng_txt:
+            full_english.append(eng_txt)
+
+        for seg in segs:
+            s_start = chunk_offset + seg.get("start", 0.0)
+            s_end = chunk_offset + seg.get("end", 0.0)
+            s_orig = seg.get("text", "").strip()
+            s_eng = seg.get("english_text", s_orig).strip()
             all_segments.append({
-                "start": chunk_offset + seg.get("start", 0.0),
-                "end": chunk_offset + seg.get("end", 0.0),
-                "text": seg.get("text", "").strip(),
+                "start": s_start,
+                "end": s_end,
+                "text": s_orig,
+                "english_text": s_eng,
+                "language": det_lang,
             })
 
-        # 2. Dual pass for original Nepali Devanagari text if requested
-        if return_original and is_translating_nepali:
-            print(f"  -> Transcribing original Nepali (Devanagari) for chunk {i + 1}...")
-            orig_text = transcribe_chunk_whisper(chunk, language="ne", task="transcribe")
-            if orig_text and orig_text.strip():
-                original_transcript += orig_text.strip() + " "
-
         chunk_elapsed = time.perf_counter() - t_chunk_start
-        print(f"[*] Chunk {i + 1}/{total_chunks} completed in {chunk_elapsed:.2f}s")
+        print(f"[*] Chunk {i + 1}/{total_chunks} completed in {chunk_elapsed:.2f}s ({det_lang})")
 
     total_elapsed = time.perf_counter() - t_start
     print(f"[+] Transcription complete in {total_elapsed:.2f}s across {total_chunks} chunk(s).")
-    cleaned_transcript = full_transcript.strip()
+
+    english_transcript = " ".join(full_english).strip()
+    original_transcript = " ".join(full_original).strip()
+
+    overall_lang = ", ".join(detected_languages) if detected_languages else cfg["display_name"]
 
     if return_original:
         return {
-            "transcript": cleaned_transcript,
-            "original_transcript": (original_transcript.strip() if original_transcript else None),
+            "transcript": english_transcript or original_transcript,
+            "original_transcript": original_transcript,
             "segments": all_segments,
-            "display_language": cfg["display_name"],
-            "is_translated": cfg["task"] == "translate",
+            "display_language": overall_lang,
+            "detected_languages": detected_languages,
+            "is_translated": any_translated or cfg["task"] == "translate",
             "transcription_time": total_elapsed,
+            "processing_mode": active_mode,
         }
 
-    return cleaned_transcript
+    return english_transcript or original_transcript
 
 
 def translate_nepali_to_english(chunks: list, **kwargs) -> str:

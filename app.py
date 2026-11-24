@@ -203,16 +203,23 @@ st.session_state.setdefault("live_transcript_text", "")
 st.session_state.setdefault("live_messages", [])
 st.session_state.setdefault("trigger_live_intelligence", False)
 st.session_state.setdefault("retranscribe_offline_choice", False)
+st.session_state.setdefault("processing_mode", "balanced")
 if st.session_state.recorder is None:
     st.session_state.recorder = AudioRecorder()
 
-# Supported language options matching requirements
+# Supported language options matching requirements (Auto-detect default)
 LANGUAGE_OPTIONS = [
+    "Automatic language detection",
     "English transcription",
-    "Hinglish transcription using the existing Sarvam integration",
     "Nepali transcription",
     "Nepali speech → English text",
-    "Automatic language detection",
+    "Hinglish transcription using the existing Sarvam integration",
+]
+
+PROCESSING_MODE_OPTIONS = [
+    "Balanced (Standard)",
+    "Fast (Lowest Latency - CPU Optimized)",
+    "High Accuracy (Complex Accents & Code-Switching)",
 ]
 
 # Pause between LLM calls to stay under API rate limits (same as the CLI).
@@ -232,19 +239,19 @@ def save_upload(uploaded) -> str:
     return target
 
 
-def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False, session_id: str = None) -> dict:
+def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = False, session_id: str = None, processing_mode: str = None) -> dict:
     """Same steps as the CLI pipeline, with live progress in the UI and stage-by-stage timing metrics."""
     if not session_id:
         source_base = os.path.splitext(os.path.basename(source))[0][:16].replace(" ", "_")
         session_id = f"{source_base}_{uuid.uuid4().hex[:6]}" if source_base else f"ui_{uuid.uuid4().hex[:8]}"
 
     mode_info = resolve_language_mode(language)
-    is_nepali_translate = (mode_info.get("whisper_code") == "ne" and mode_info.get("task") == "translate")
+    proc_mode = processing_mode or st.session_state.get("processing_mode", "balanced")
 
     stage_timings = {}
     t_pipeline_start = time.perf_counter()
 
-    with st.status("Working on your video", expanded=True) as status:
+    with st.status(f"Working on your audio/video ({proc_mode.title()} Mode)", expanded=True) as status:
         progress_bar = st.progress(0.0, text="Starting processing...")
 
         st.write("📥 Downloading and preparing audio...")
@@ -260,14 +267,14 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
             progress_bar.progress(min(pct, 0.65), text=f"Transcribing speech: chunk {curr}/{total}...")
             st.write(f"  • Transcribing chunk {curr}/{total}...")
 
-        if is_nepali_translate:
-            st.write("🎙️ Translating Nepali speech to English...")
-            if keep_original_nepali:
-                st.write("🎙️ Transcribing original Nepali speech (Devanagari)...")
-            res = transcribe_all(chunks, language=language, return_original=keep_original_nepali, progress_callback=on_transcribe_chunk)
-        else:
-            st.write(f"🎙️ Transcribing speech ({mode_info['display_name']})...")
-            res = transcribe_all(chunks, language=language, return_original=False, progress_callback=on_transcribe_chunk)
+        st.write(f"🎙️ Multilingual speech recognition active ({mode_info['display_name']} — {proc_mode.title()} Mode)...")
+        res = transcribe_all(
+            chunks,
+            language=language,
+            return_original=True,
+            progress_callback=on_transcribe_chunk,
+            processing_mode=proc_mode,
+        )
 
         stage_timings["Speech Transcription"] = time.perf_counter() - t0
         st.write(f"✓ Transcription complete ({stage_timings['Speech Transcription']:.2f}s)")
@@ -277,10 +284,12 @@ def run_pipeline_ui(source: str, language: str, keep_original_nepali: bool = Fal
             transcript = res.get("transcript", "")
             original_transcript = res.get("original_transcript")
             segments = res.get("segments")
+            detected_lang = res.get("display_language", mode_info["display_name"])
         else:
             transcript = str(res)
             original_transcript = None
             segments = None
+            detected_lang = mode_info["display_name"]
 
         st.write("🧠 Generating insights in parallel (Title, Summary, Action Items, Decisions, Questions)...")
         t_llm = time.perf_counter()
@@ -376,6 +385,7 @@ def process_live_intelligence_ui(
     session_id: str = None,
     dropped_chunks_count: int = 0,
     dropped_audio_seconds: float = 0.0,
+    original_transcript: str = None,
 ) -> dict:
     """Generate meeting intelligence directly from finalized live transcript segments."""
     if not session_id:
@@ -449,7 +459,7 @@ def process_live_intelligence_ui(
 
     return {
         "transcript": transcript,
-        "original_transcript": None,
+        "original_transcript": original_transcript,
         "segments": segments,
         "title": title,
         "summary": summary,
@@ -563,8 +573,23 @@ with st.sidebar:
         "Spoken language",
         LANGUAGE_OPTIONS,
         index=default_idx,
+        help="Automatic detection is enabled by default to transcribe and translate English, Hindi, Nepali, and mixed code-switching.",
     )
     st.session_state.language = language
+
+    mode_label = st.selectbox(
+        "AI processing mode",
+        PROCESSING_MODE_OPTIONS,
+        index=0,
+        help="Fast (tiny model) minimizes CPU latency. Balanced (small) provides standard accuracy. High Accuracy (medium) handles heavy accents and complex code-switching.",
+    )
+    mode_map = {
+        "Balanced (Standard)": "balanced",
+        "Fast (Lowest Latency - CPU Optimized)": "fast",
+        "High Accuracy (Complex Accents & Code-Switching)": "high_accuracy",
+    }
+    selected_proc_mode = mode_map.get(mode_label, "balanced")
+    st.session_state.processing_mode = selected_proc_mode
 
     keep_original_nepali = False
     if language == "Nepali speech → English text":
@@ -620,8 +645,8 @@ with st.sidebar:
         if rec_state == RecordingState.IDLE:
             if col_r1.button("Start recording", type="primary", use_container_width=True):
                 try:
-                    # Initialize live transcriber & chunker with selected language
-                    live_trans = LiveTranscriber(language=language)
+                    # Initialize live transcriber & chunker with selected language & processing mode
+                    live_trans = LiveTranscriber(language=language, processing_mode=selected_proc_mode)
                     chunker = LiveAudioChunker(live_trans)
                     rec.attach_live_chunker(chunker)
                     live_trans.start()
@@ -798,12 +823,17 @@ if st.session_state.get("trigger_live_intelligence"):
     try:
         if not do_offline and has_live_transcript:
             snap = live_trans.transcript.get_snapshot()
-            transcript_text = snap.get("full_text", snap.get("text", "")).strip()
-            if not transcript_text:
-                transcript_text = st.session_state.live_transcript_text.strip()
+            eng_text = snap.get("english_full_text", "").strip()
+            orig_text = snap.get("full_text", snap.get("text", "")).strip()
+            if not orig_text:
+                orig_text = st.session_state.live_transcript_text.strip()
+            
+            # Use English transcript as primary for LLM intelligence; fallback to orig_text
+            analysis_transcript = eng_text if eng_text else orig_text
+            original_for_record = orig_text if (eng_text and orig_text != eng_text) else None
 
             st.session_state.result = process_live_intelligence_ui(
-                transcript=transcript_text,
+                transcript=analysis_transcript,
                 segments=snap.get("segments", []),
                 language=language,
                 audio_source=f"Live Recording ({rec.source.value if rec else 'Audio'})",
@@ -811,6 +841,7 @@ if st.session_state.get("trigger_live_intelligence"):
                 session_id=sess_id,
                 dropped_chunks_count=snap.get("dropped_chunks_count", 0),
                 dropped_audio_seconds=snap.get("dropped_audio_seconds", 0.0),
+                original_transcript=original_for_record,
             )
         elif st.session_state.recorded_audio_path and os.path.exists(st.session_state.recorded_audio_path):
             st.session_state.result = run_pipeline_ui(

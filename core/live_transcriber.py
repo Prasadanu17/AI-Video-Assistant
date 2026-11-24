@@ -55,8 +55,9 @@ class LiveTranscriptSegment:
     index: int
     start: float  # Timeline start in seconds
     end: float    # Timeline end in seconds
-    text: str
+    text: str     # Verbatim original text (Devanagari / English / Mixed)
     language: str
+    english_text: Optional[str] = None  # Aligned English translated text
     is_final: bool = True
 
 
@@ -87,8 +88,20 @@ class LiveTranscript:
 
     @property
     def full_text(self) -> str:
+        """Verbatim original transcript containing spoken languages (Devanagari + English)."""
         with self._lock:
             return " ".join(s.text.strip() for s in self.segments if s.text.strip()).strip()
+
+    @property
+    def english_full_text(self) -> str:
+        """English translated transcript for clean meeting analysis and notes."""
+        with self._lock:
+            parts = []
+            for s in self.segments:
+                txt = s.english_text if s.english_text and s.english_text.strip() else s.text
+                if txt and txt.strip():
+                    parts.append(txt.strip())
+            return " ".join(parts).strip()
 
     @property
     def real_time_factor(self) -> float:
@@ -101,6 +114,12 @@ class LiveTranscript:
         """Return a thread-safe copy of the live transcript state for UI rendering."""
         with self._lock:
             text_val = " ".join(s.text.strip() for s in self.segments if s.text.strip()).strip()
+            eng_parts = []
+            for s in self.segments:
+                t = s.english_text if s.english_text and s.english_text.strip() else s.text
+                if t and t.strip():
+                    eng_parts.append(t.strip())
+            eng_val = " ".join(eng_parts).strip()
             rtf = (self.total_inference_seconds / self.total_audio_seconds) if self.total_audio_seconds > 0.0 else 0.0
             return {
                 "segments": [
@@ -109,6 +128,7 @@ class LiveTranscript:
                         "start": s.start,
                         "end": s.end,
                         "text": s.text,
+                        "english_text": s.english_text or s.text,
                         "language": s.language,
                         "is_final": s.is_final,
                     }
@@ -116,6 +136,9 @@ class LiveTranscript:
                 ],
                 "full_text": text_val,
                 "text": text_val,
+                "original_text": text_val,
+                "english_full_text": eng_val,
+                "english_text": eng_val,
                 "is_busy": self.is_busy,
                 "segment_count": len(self.segments),
                 "total_audio_seconds": self.total_audio_seconds,
@@ -279,18 +302,21 @@ class LiveTranscriber:
     """
     Background worker orchestrating incremental live transcription.
     Decoupled from audio capture via a thread-safe Queue with backpressure monitoring.
+    Supports Fast, Balanced, and High Accuracy processing modes and real-time dual-transcript streaming.
     """
 
     def __init__(
         self,
-        language: str = "english",
+        language: str = "auto",
         chunk_seconds: float = 5.0,
         overlap_seconds: float = 1.0,
         sample_rate: int = 16000,
         mock_mode: bool = False,
+        processing_mode: Optional[str] = None,
         on_segment_callback: Optional[Callable[[LiveTranscriptSegment], None]] = None,
     ):
         self.language = language
+        self.processing_mode = processing_mode
         try:
             cfg = resolve_language_mode(language)
             self.whisper_lang = cfg.get("whisper_code")
@@ -572,6 +598,8 @@ class LiveTranscriber:
         chunk_duration = end_time - start_time
 
         t0 = time.perf_counter()
+        res_dict = None
+        text = ""
 
         if self.mock_mode:
             # Deterministic simulation for tests
@@ -590,6 +618,7 @@ class LiveTranscriber:
             initial_prompt = " ".join(trailing_words[-15:]) if trailing_words else None
 
             # Direct in-memory NumPy inference with safe fallback to temporary WAV
+            res_dict = None
             try:
                 res = transcribe_chunk(
                     clean_pcm,
@@ -597,8 +626,13 @@ class LiveTranscriber:
                     task=self.whisper_task,
                     return_segments=True,
                     initial_prompt=initial_prompt,
+                    processing_mode=self.processing_mode,
                 )
-                text = res["text"] if isinstance(res, dict) else str(res)
+                if isinstance(res, dict):
+                    res_dict = res
+                    text = res.get("text", "")
+                else:
+                    text = str(res)
             except Exception as direct_err:
                 # Safe fallback to temporary WAV file if in-memory fails
                 tmp_wav = self._write_temp_chunk(clean_pcm)
@@ -609,8 +643,13 @@ class LiveTranscriber:
                         task=self.whisper_task,
                         return_segments=True,
                         initial_prompt=initial_prompt,
+                        processing_mode=self.processing_mode,
                     )
-                    text = res["text"] if isinstance(res, dict) else str(res)
+                    if isinstance(res, dict):
+                        res_dict = res
+                        text = res.get("text", "")
+                    else:
+                        text = str(res)
                 finally:
                     if os.path.exists(tmp_wav):
                         try:
@@ -629,24 +668,33 @@ class LiveTranscriber:
             self.transcript.total_audio_seconds += chunk_duration
             self.transcript.total_inference_seconds += t_inf
 
-        clean_text = text.strip()
-        if not clean_text:
+        orig_text = res_dict.get("original_text", text) if res_dict else text
+        eng_text = res_dict.get("english_text", text) if res_dict else text
+        det_lang = res_dict.get("detected_language", self.language) if res_dict else self.language
+
+        clean_text = (orig_text or text).strip()
+        clean_eng = (eng_text or text).strip()
+        if not clean_text and not clean_eng:
             return
 
-        # Deduplicate overlap against previous segment
+        # Deduplicate overlap against previous segments
         prev_text = self.transcript.full_text
-        deduped_text = deduplicate_overlap(prev_text, clean_text)
+        deduped_text = deduplicate_overlap(prev_text, clean_text) if clean_text else ""
 
-        if not deduped_text:
+        prev_eng = self.transcript.english_full_text
+        deduped_eng = deduplicate_overlap(prev_eng, clean_eng) if clean_eng else deduped_text
+
+        if not deduped_text and not deduped_eng:
             return
 
-        # Create finalized segment
+        # Create finalized segment with aligned dual streams
         segment = LiveTranscriptSegment(
             index=self._segment_index,
             start=round(start_time, 2),
             end=round(end_time, 2),
-            text=deduped_text,
-            language=self.language,
+            text=deduped_text or deduped_eng,
+            language=det_lang,
+            english_text=deduped_eng or deduped_text,
             is_final=True,
         )
         self._segment_index += 1
